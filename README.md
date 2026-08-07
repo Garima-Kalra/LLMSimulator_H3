@@ -52,4 +52,5 @@ Kwanhee Kyung kwanhee.kyung@scale.snu.ac.kr
 Juhwan Cho juhwan.cho@scale.snu.ac.kr
 
 ## Note
-This simulator builds upon the simulator introduced in the MICRO 2024 paper “Duplex: A Device for Large Language Models with Mixture of Experts, Grouped Query Attention, and Continuous Batching.”
+This simulator builds upon the simulator introduced in the MICRO 2024 paper “Duplex: A Device for Large Language Models with Mixture of Experts, Grouped Query Attention, and Continuous Batching.”# LLMsim
+# LLMsim
