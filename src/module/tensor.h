@@ -45,6 +45,12 @@ class Tensor : public std::enable_shared_from_this<Tensor> {
   bool isDecoder = false;
   bool isMemPoolLoad = false;
 
+  // H3: true when this tensor is placed in High Bandwidth Flash rather
+  // than HBM. Set at construction time from tag ("weight" / "cache_shared")
+  // and device->config.use_hbf; read by getIdealMemoryStatus to pick the
+  // bandwidth used for this tensor's memory-time calculation.
+  bool in_hbf = false;
+
   int dim(int i);
 
   void set();

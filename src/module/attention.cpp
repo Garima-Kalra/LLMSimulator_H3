@@ -21,19 +21,45 @@ SelfAttentionGen::SelfAttentionGen(std::string& prefix, std::string& name,
       qk_rope_head_dim(qk_rope_head_dim) {
   int parallel_num = device_list.size();
 
+  // KV cache tensors use kv_cache_precision_byte, which may differ from
+  // weight/activation precision_byte (see model_config.h).
+  int kv_precision = device->model_config.kv_cache_precision_byte;
+
   std::vector<int> shape = {max_seq_len, head_dim};
   for (int seq_idx = 0; seq_idx < batch_size; seq_idx++) {
     for (int kv_idx = 0; kv_idx < num_kv_heads; kv_idx++) {
       Tensor::Ptr k_cache = Tensor::Create(
           "k_cache_" + std::to_string(seq_idx) + "_" + std::to_string(kv_idx),
-          shape, "cache", device, device->model_config.precision_byte);
+          shape, "cache", device, kv_precision);
       add_tensor(k_cache);
 
       Tensor::Ptr v_cache = Tensor::Create(
           "v_cache_" + std::to_string(seq_idx) + "_" + std::to_string(kv_idx),
-          shape, "cache", device, device->model_config.precision_byte);
+          shape, "cache", device, kv_precision);
       add_tensor(v_cache);
     }
+  }
+
+  // H3/CAG: a single shared K/V handle tensor pair, representing the
+  // gigantic pre-computed KV cache read (once per iteration) by every
+  // sequence in the batch -- unlike the per-slot caches above, these are
+  // created once, not per seq_idx, and their shape already aggregates all
+  // num_kv_heads (the private-cache tensors above instead get this factor
+  // by being created once per kv_idx). Placed in HBF when use_hbf is on.
+  if (device->model_config.shared_kv_cache_len > 0) {
+    // H3: context_parallel_degree > 1 splits the shared cache length across
+    // the devices that jointly own this KV head (see parallel.cpp) -- each
+    // device here only holds/reads its 1/context_parallel_degree slice.
+    int cp_dg = device->model_config.context_parallel_degree;
+    int shared_len_local = device->model_config.shared_kv_cache_len / cp_dg;
+    std::vector<int> shared_shape = {shared_len_local, head_dim * num_kv_heads};
+    Tensor::Ptr k_cache_shared = Tensor::Create(
+        "k_cache_shared", shared_shape, "cache_shared", device, kv_precision);
+    add_tensor(k_cache_shared);
+
+    Tensor::Ptr v_cache_shared = Tensor::Create(
+        "v_cache_shared", shared_shape, "cache_shared", device, kv_precision);
+    add_tensor(v_cache_shared);
   }
 
   Tensor::Ptr output = Tensor::Create("attn_output", shape, "act", device, device->model_config.precision_byte);
@@ -65,6 +91,11 @@ Tensor::Ptr SelfAttentionGen::forward(const Tensor::Ptr input,
   tensor_list.push_back(input);
   tensor_list.push_back(get_cache("k_cache", 0, 0, false));
   tensor_list.push_back(get_cache("v_cache", 0, 0, false));
+
+  if (device->model_config.shared_kv_cache_len > 0) {
+    tensor_list.push_back(get_shared_cache("k_cache_shared"));
+    tensor_list.push_back(get_shared_cache("v_cache_shared"));
+  }
 
   device->execution(LayerType::ATTENTION_GEN, tensor_list, sequences_metadata,
                     layer_info);
@@ -438,6 +469,12 @@ Tensor::Ptr MultiLatentAttentionSum::forward(const Tensor::Ptr input,
 
 // MultiLatentAttentionGen //
 
+// NOTE: H3/CAG shared-KV-cache wiring (see SelfAttentionGen above) is not
+// yet implemented for MultiLatentAttentionGen/AbsorbMLAGen (MLA / DeepSeek
+// -style models); shared_kv_cache_len has no effect on those paths.
+// Un-compressed/absorbed-MLA models will run CAG workloads as if the whole
+// context were private per-sequence KV cache. The paper's own evaluation
+// workload (Llama 3.1 405B) uses plain GQA, i.e. SelfAttentionGen.
 AbsorbMLAGen::AbsorbMLAGen(std::string& prefix, std::string& name,
     int head_dim, int num_heads,
     int num_kv_heads, int max_seq_len,

@@ -5,6 +5,7 @@
 #include "common/type.h"
 #include "dram/dram_type.h"
 #include "hardware/base.h"
+#include "hardware/hardware_config.h"
 #include "module/status.h"
 #include "model/model_config.h"
 #include "scheduler/sequence.h"
@@ -17,6 +18,14 @@ ExecStatus issueRamulator(Device_Ptr device, LayerType layer_type,
 
 ExecStatus getIdealMemoryStatus(Device_Ptr device, ProcessorType processor_type,
                           DRAMRequestType dram_request_type, Tensor_Ptr tensor);
+
+// H3: HBM and HBF are independent, concurrently-accessible channels (see
+// paper Fig. 3 -- GPU reaches HBF through the HBM base die's address
+// router on a separate path), so the roofline memory time for an op that
+// touches both is the max of each channel's own bytes/bandwidth, not their
+// sum. hbf_bytes is ignored (folded into hbm_bytes by the caller) when
+// config.use_hbf is false.
+time_ns h3MemoryDuration(SystemConfig config, hw_metric hbm_bytes, hw_metric hbf_bytes);
 
 ExecStatus LinearExecutionGPU(Device_Ptr device, Tensor_Ptr input,
                               Tensor_Ptr weight, Tensor_Ptr ouptut,

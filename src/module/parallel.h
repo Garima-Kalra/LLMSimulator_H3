@@ -151,6 +151,12 @@ class SelfAttentionParallel : public Module {
   int num_kv_heads;
   int qk_rope_head_dim;
   bool compressed_kv;
+  // H3: true when context_parallel_degree > 1, i.e. a "context_merge"
+  // AllReduce module was constructed to combine this device's partial
+  // (shared-cache-slice-local) attention result with its cp-group peers.
+  // Module::get_module throws on a missing name, so this flag guards the
+  // forward()-time lookup instead of probing for the module's existence.
+  bool has_context_merge = false;
 };
 
 class RowSplit : public Module {

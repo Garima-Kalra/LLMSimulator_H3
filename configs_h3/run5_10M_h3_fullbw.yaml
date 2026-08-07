@@ -8,7 +8,7 @@ system:
   num_node: 4
   num_device: 8
   processor_type: GPU
-  use_hbf: off # H3: add High Bandwidth Flash as a second memory tier (weights + shared KV cache)
+  use_hbf: on # H3: add High Bandwidth Flash as a second memory tier (weights + shared KV cache)
   hbf_bandwidth_scale: 1.0 # sensitivity knob, e.g. 0.5 for halved HBF bandwidth
   distribution:
     expert_tensor_degree: 32

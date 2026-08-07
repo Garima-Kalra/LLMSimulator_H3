@@ -217,25 +217,32 @@ bool Cluster::checkMemorySize() {
     }
   }
 
+  // H3/CAG: on the HBM-only baseline (this function) there is no HBF to
+  // place the shared pre-computed KV cache in, so -- unlike
+  // checkH3MemorySize -- it must be counted here as fixed HBM usage, same
+  // as weight. Without this, an HBM-only CAG run would silently undercount
+  // its own memory footprint.
   double size = 0;
   if(device->model_config.q_lora_rank == 0){
     std::cout << "ACT: "
             << size_vector.at(0) / 1024.0 / 1024 / 1024 /
                    device->model_config.num_layers
             << "GB, Weight: " << size_vector.at(1) / 1024.0 / 1024 / 1024
-            << "GB, Cache: " << size_vector.at(2) / 1024.0 / 1024 / 1024 << "GB"
+            << "GB, Cache: " << size_vector.at(2) / 1024.0 / 1024 / 1024
+            << "GB, Shared Cache: " << size_vector.at(3) / 1024.0 / 1024 / 1024 << "GB"
             << std::endl;
     size = size_vector.at(0) / device->model_config.num_layers +
-            size_vector.at(1) + size_vector.at(2);
+            size_vector.at(1) + size_vector.at(2) + size_vector.at(3);
   }
   else{ // for MLA
     std::cout << "ACT: "
             << activation_size / 1024.0 / 1024 / 1024
             << "GB, Weight: " << size_vector.at(1) / 1024.0 / 1024 / 1024
-            << "GB, Cache: " << size_vector.at(2) / 1024.0 / 1024 / 1024 << "GB"
+            << "GB, Cache: " << size_vector.at(2) / 1024.0 / 1024 / 1024
+            << "GB, Shared Cache: " << size_vector.at(3) / 1024.0 / 1024 / 1024 << "GB"
             << std::endl;
-    size =activation_size + size_vector.at(1) + size_vector.at(2);               
-  }            
+    size =activation_size + size_vector.at(1) + size_vector.at(2) + size_vector.at(3);
+  }
                  
   std::cout << "Total: " << size / 1024.0 / 1024 / 1024 << "GB" << std::endl;
   if (size > config.memory_capacity) {
@@ -251,27 +258,36 @@ bool Cluster::checkMemorySize() {
           device->model_config.num_layers * device->model_config.precision_byte;
       }
       else{
+        // H3: num_kv_heads/head_tp_dg (not ne_tp_dg directly) -- the
+        // private per-sequence cache isn't context-parallel-split (see
+        // attention.cpp), so this device's private-cache share is governed
+        // by how many whole KV heads it owns, unaffected by
+        // context_parallel_degree's duplication of that ownership across
+        // its cp-group. At context_parallel_degree=1, head_tp_dg==ne_tp_dg
+        // and this is unchanged.
+        int head_tp_dg = device->model_config.ne_tp_dg /
+                        device->model_config.context_parallel_degree;
         kv_cache_size_per_seq =
             2.0 *
             (device->model_config.input_len + device->model_config.output_len) *
             device->model_config.num_layers * device->model_config.head_dim *
-            device->model_config.num_kv_heads / device->model_config.ne_tp_dg *
-            device->model_config.precision_byte;
+            device->model_config.num_kv_heads / head_tp_dg *
+            device->model_config.kv_cache_precision_byte;
       }
       hw_metric avail_capacity = 0;
       if(device->model_config.q_lora_rank == 0){
         avail_capacity =
             config.memory_capacity -
             (size_vector.at(0) / device->model_config.num_layers) -
-            size_vector.at(1);
+            size_vector.at(1) - size_vector.at(3);
       }
       else{
         avail_capacity =
-            config.memory_capacity - activation_size - size_vector.at(1);
+            config.memory_capacity - activation_size - size_vector.at(1) - size_vector.at(3);
       }
 
       if (avail_capacity < 0) {
-        fail("Memory capacity is smaller than model weight");
+        fail("Memory capacity is smaller than model weight + shared KV cache");
       }
       std::cout << "Available capacity for KV cache is "
                 << avail_capacity / 1024.0 / 1024 / 1024 << "GB" << std::endl;
@@ -338,6 +354,94 @@ bool Cluster::checkHeteroMemorySize() {
       scheduler->total_batch_size = max_batch_size - 1;
       scheduler->batch_size_per_dp =
           (max_batch_size - 1) / scheduler->dp_degree;
+      scheduler->clear();
+      scheduler->initRunningQueue();
+      return false;
+    }
+  }
+  return false;
+}
+
+bool Cluster::checkH3MemorySize() {
+  Device::Ptr device = get_device(0);
+  auto module = module_map.at(0).at("::LLM");
+  auto size_vector = module->get_size(); // [act, weight, cache, cache_shared]
+
+  std::cout << "ACT: "
+            << size_vector.at(0) / 1024.0 / 1024 / 1024 /
+                   device->model_config.num_layers
+            << "GB, Weight: " << size_vector.at(1) / 1024.0 / 1024 / 1024
+            << "GB, Cache: " << size_vector.at(2) / 1024.0 / 1024 / 1024
+            << "GB, Shared Cache: " << size_vector.at(3) / 1024.0 / 1024 / 1024 << "GB"
+            << std::endl;
+
+  // HBF: weights + shared pre-computed KV cache -- both read-only and
+  // independent of batch size.
+  double hbf_size = size_vector.at(1) + size_vector.at(3);
+  std::cout << "HBF Total: " << hbf_size / 1024.0 / 1024 / 1024
+            << "GB (capacity " << config.hbf_capacity / 1024.0 / 1024 / 1024
+            << "GB)" << std::endl;
+  if (hbf_size > config.hbf_capacity) {
+    fail("H3: model weights + shared KV cache exceed HBF capacity");
+  }
+
+  // HBM: activations + private (per-sequence, generated) KV cache. Unlike
+  // checkMemorySize/checkHeteroMemorySize, avail_capacity below is NOT
+  // reduced by weight size -- weights live in HBF now, which is exactly
+  // what frees HBM capacity for a larger batch size.
+  double hbm_size =
+      (size_vector.at(0) / device->model_config.num_layers) + size_vector.at(2);
+  std::cout << "HBM Total: " << hbm_size / 1024.0 / 1024 / 1024
+            << "GB (capacity " << config.memory_capacity / 1024.0 / 1024 / 1024
+            << "GB)" << std::endl;
+
+  if (hbm_size > config.memory_capacity) {
+    if (config.exit_out_of_memory) {
+      return true;
+    } else if (config.mem_cap_limit == true) {
+      long long kv_cache_size_per_seq = 0;
+      if ((device->model_config.qk_rope_head_dim != 0) && (device->model_config.compressed_kv == true)) {
+        kv_cache_size_per_seq = 1.0 *
+          (device->model_config.input_len + device->model_config.output_len) *
+          (device->model_config.kv_lora_rank + device->model_config.qk_rope_head_dim) *
+          device->model_config.num_layers * device->model_config.precision_byte;
+      }
+      else{
+        // H3: see checkMemorySize's identical comment -- num_kv_heads /
+        // head_tp_dg, not ne_tp_dg, since the private cache isn't
+        // context-parallel-split.
+        int head_tp_dg = device->model_config.ne_tp_dg /
+                        device->model_config.context_parallel_degree;
+        kv_cache_size_per_seq =
+            2.0 *
+            (device->model_config.input_len + device->model_config.output_len) *
+            device->model_config.num_layers * device->model_config.head_dim *
+            device->model_config.num_kv_heads / head_tp_dg *
+            device->model_config.kv_cache_precision_byte;
+      }
+
+      hw_metric avail_capacity =
+          config.memory_capacity - (size_vector.at(0) / device->model_config.num_layers);
+
+      if (avail_capacity < 0) {
+        fail("Memory capacity is smaller than activation size");
+      }
+      std::cout << "Available HBM capacity for private KV cache is "
+                << avail_capacity / 1024.0 / 1024 / 1024 << "GB" << std::endl;
+      std::cout << "Private KV cache per seq is "
+                << kv_cache_size_per_seq / 1024.0 / 1024 / 1024 << "GB" << std::endl;
+      int max_batch_size =
+          (int)(avail_capacity / kv_cache_size_per_seq) * scheduler->dp_degree;
+      std::cout << "H3: Modify max_batch_size to " << max_batch_size - 1
+                << std::endl;
+      scheduler->total_batch_size = max_batch_size - 1;
+      scheduler->batch_size_per_dp =
+          (max_batch_size - 1) / scheduler->dp_degree;
+      scheduler->clear();
+      scheduler->initRunningQueue();
+      return false;
+    }
+    else{
       scheduler->clear();
       scheduler->initRunningQueue();
       return false;

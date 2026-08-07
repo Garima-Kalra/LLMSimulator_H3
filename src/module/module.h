@@ -62,6 +62,11 @@ class Module : public std::enable_shared_from_this<Module> {
   Tensor::Ptr get_cache(std::string name, int seq_idx, int kv_idx, bool compressed_kv,
                         std::vector<int> shape = {1, 1});
 
+  // H3/CAG: fetch a shared (non-per-sequence) cache tensor by its exact
+  // name, e.g. "k_cache_shared" -- unlike get_cache, no seq/kv-index
+  // suffix is appended.
+  Tensor::Ptr get_shared_cache(std::string name);
+
   template <class T>
   void add_module(std::shared_ptr<T> module) {
     Module::Ptr _module = std::static_pointer_cast<Module>(module);

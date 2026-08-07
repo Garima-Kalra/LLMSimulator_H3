@@ -18,6 +18,11 @@ Tensor::Tensor(std::string name, std::vector<int> shape, std::string tag,
   perform_with_optimal = false;
   parallel_execution = false;
   perform_at_high = true;
+
+  if (device != nullptr && device->config.use_hbf &&
+      (tag == "weight" || tag == "cache_shared")) {
+    in_hbf = true;
+  }
 }
 
 long Tensor::getSize() {

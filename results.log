@@ -1,0 +1,5 @@
+timestamp,model,gpu_gen,use_hbf,hbf_bandwidth_scale,num_node,num_device,ne_tp_dg,context_parallel_degree,fp8_compute_doubling,context_window,input_len,output_len,requested_max_batch_size,final_max_batch_size,throughput_tps,per_device_power_w,total_power_w,throughput_per_power
+1786096082,llama3_405B,B200,0,1,1,8,8,1,1,1000000,1000,1000,8000,666,1771.52,1000,8000,0.22144
+1786096802,llama3_405B,B200,1,1,1,8,8,1,1,1000000,1000,1000,8000,1587,1801.75,2280,18240,0.0987802
+1786096827,llama3_405B,B200,1,0.5,1,8,8,1,1,1000000,1000,1000,8000,1587,1785.44,2280,18240,0.0978859
+1786096875,llama3_405B,B200,0,1,1,8,8,1,1,1000000,1000,1000,3000,669,1771.75,1000,8000,0.221468

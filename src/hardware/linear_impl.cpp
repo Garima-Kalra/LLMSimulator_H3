@@ -27,10 +27,14 @@ ExecStatus LinearExecutionGPU(Device_Ptr device, Tensor_Ptr input,
   hw_metric total_flops = 2.0 * m * k * n;
   hw_metric total_memory_size = (m * k + k * n + m * n) * weight->precision_byte;
 
+  // H3: weight bytes (k*n) may live in HBF; input/output stay in HBM.
+  hw_metric weight_bytes = k * n * weight->precision_byte;
+  hw_metric hbm_bytes = weight->in_hbf ? (m * k + m * n) * weight->precision_byte : total_memory_size;
+  hw_metric hbf_bytes = weight->in_hbf ? weight_bytes : 0;
+
   time_ns compute_duration =
       total_flops / compute_peak_flops * 1000 * 1000 * 1000;
-  time_ns memory_duration =
-      total_memory_size / memory_bandwidth * 1000 * 1000 * 1000;
+  time_ns memory_duration = h3MemoryDuration(config, hbm_bytes, hbf_bytes);
 
   ExecStatus exec_status;
   if (input->getSize() == 0) {
@@ -38,7 +42,7 @@ ExecStatus LinearExecutionGPU(Device_Ptr device, Tensor_Ptr input,
   }
 
   exec_status.compute_duration = compute_duration;
-  
+
   if (use_ramulator) {
     exec_status +=
         issueRamulator(device, LayerType::LINEAR, ProcessorType::GPU,
@@ -224,17 +228,23 @@ ExecStatus BatchedLinearExecutionGPU(Device_Ptr device, Tensor_Ptr input,
   hw_metric total_flops = 2.0 * m * k * n * 1.0 * num_heads;
   
   hw_metric total_memory_size;
+  hw_metric weight_bytes;
   if(duplicated_input){
+    weight_bytes = k * n * 1.0 * num_heads * weight->precision_byte;
     total_memory_size = 1.0 * (m * k + k * n * 1.0  * num_heads + m * n * 1.0  * num_heads) * weight->precision_byte;
   }
   else{
+    weight_bytes = k * n * 1.0 * num_heads * weight->precision_byte;
     total_memory_size = 1.0 * (m * k + k * n + m * n) * 1.0  * num_heads * weight->precision_byte;
   }
 
+  // H3: weight bytes may live in HBF; input/output stay in HBM.
+  hw_metric hbm_bytes = weight->in_hbf ? (total_memory_size - weight_bytes) : total_memory_size;
+  hw_metric hbf_bytes = weight->in_hbf ? weight_bytes : 0;
+
   time_ns compute_duration =
       total_flops / compute_peak_flops * 1000 * 1000 * 1000;
-  time_ns memory_duration =
-      total_memory_size / memory_bandwidth * 1000 * 1000 * 1000;
+  time_ns memory_duration = h3MemoryDuration(config, hbm_bytes, hbf_bytes);
 
   ExecStatus exec_status;
   if (input->getSize() == 0) {

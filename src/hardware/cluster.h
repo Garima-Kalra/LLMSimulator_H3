@@ -72,6 +72,7 @@ class Cluster : public std::enable_shared_from_this<Cluster> {
 
   bool checkMemorySize();
   bool checkHeteroMemorySize();
+  bool checkH3MemorySize();
   std::vector<energy_nJ> getTotalEnergy();
 
   void setTimeBreakDown(Stat &stat);

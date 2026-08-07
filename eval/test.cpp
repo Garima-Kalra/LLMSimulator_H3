@@ -1,6 +1,8 @@
 #include <yaml-cpp/yaml.h>
 
 #include <algorithm>
+#include <ctime>
+#include <fstream>
 #include <iostream>
 
 #include "hardware/stat.h"
@@ -31,6 +33,7 @@ int main(int argc, char *argv[]) {
   std::string data_name = config["simulation"]["data"].as<std::string>();
   int input_len = config["simulation"]["input_len"].as<int>();
   int output_len = config["simulation"]["output_len"].as<int>();
+  int context_window = config["simulation"]["context_window"].as<int>();
   int iter = config["simulation"]["iter"].as<int>();
 
   int max_batch_size = config["serving"]["max_batch_size"].as<int>();
@@ -38,22 +41,32 @@ int main(int argc, char *argv[]) {
   int max_process_token = config["serving"]["max_process_token"].as<int>();
   std::string output_path = config["log"]["output_directory"].as<std::string>();
 
+  bool use_hbf = config["system"]["use_hbf"].as<bool>();
+  std::string gpu_gen = config["system"]["gpu_gen"].as<std::string>();
+
   SystemConfig system_config;
-  if(config["system"]["gpu_gen"].as<std::string>() == "A100"){
+  if(gpu_gen == "A100"){
     system_config = A100;
   }
-  else if (config["system"]["gpu_gen"].as<std::string>() == "H100"){
+  else if (gpu_gen == "H100"){
     system_config = H100;
   }
-  else if (config["system"]["gpu_gen"].as<std::string>() == "B100"){
+  else if (gpu_gen == "B100"){
     system_config = B100;
   }
-  else if (config["system"]["gpu_gen"].as<std::string>() == "B200"){
-    system_config = B200;
+  else if (gpu_gen == "B200"){
+    system_config = use_hbf ? B200_H3 : B200;
   }
   else{
     fail("No GPU generation information");
   }
+
+  if(use_hbf && gpu_gen != "B200"){
+    fail("H3 (use_hbf) is currently only supported for gpu_gen: B200");
+  }
+
+  system_config.hbf_bandwidth_scale =
+      config["system"]["hbf_bandwidth_scale"].as<double>();
 
   // NVLink Config // 
   if(config["system"]["nvlink_gen"].as<int>() == 4){
@@ -185,7 +198,18 @@ int main(int argc, char *argv[]) {
       config["system"]["distribution"]["expert_tensor_degree"].as<int>();
   model_config.ne_tp_dg =
       config["system"]["distribution"]["none_expert_tensor_degree"].as<int>();
-  
+
+  // H3: context_parallel_degree > 1 splits the shared CAG cache across the
+  // extra devices within a KV-head's TP group, letting ne_tp_dg exceed
+  // num_kv_heads (see model_config.h and SelfAttentionParallel).
+  model_config.context_parallel_degree =
+      config["system"]["distribution"]["context_parallel_degree"].as<int>(1);
+  assertTrue(model_config.ne_tp_dg % model_config.context_parallel_degree == 0,
+            "ne_tp_dg must be divisible by context_parallel_degree");
+  assertTrue(model_config.num_kv_heads %
+                (model_config.ne_tp_dg / model_config.context_parallel_degree) == 0,
+            "num_kv_heads must be divisible by ne_tp_dg/context_parallel_degree");
+
   model_config.compressed_kv =
       config["system"]["optimization"]["compressed_kv"].as<bool>();
   model_config.use_absorb =
@@ -194,9 +218,22 @@ int main(int argc, char *argv[]) {
       config["simulation"]["skewness"].as<double>();
   
   model_config.precision_byte = config["simulation"]["precision_byte"].as<int>();
-  if(model_config.precision_byte == 1){ // if FP8 or INT8 
+  // FP8-doubles-compute is a pre-existing (non-H3) convention, unvalidated
+  // against the paper's own methodology -- kept as a sensitivity knob
+  // (default on = today's exact behavior) rather than silently changed.
+  // See ASSUMPTIONS.md.
+  bool fp8_compute_doubling =
+      config["simulation"]["fp8_compute_doubling"].as<bool>(true);
+  if(model_config.precision_byte == 1 && fp8_compute_doubling){ // if FP8 or INT8
     system_config.compute_peak_flops *= 2; // system_config has FP16 peak FLOPS information
   }
+
+  // KV cache precision defaults to precision_byte unless overridden --
+  // e.g. the paper's own FP8-weight/FP16-KV-cache mix (see model_config.h).
+  int kv_cache_precision_byte =
+      config["simulation"]["kv_cache_precision_byte"].as<int>(0);
+  model_config.kv_cache_precision_byte =
+      kv_cache_precision_byte > 0 ? kv_cache_precision_byte : model_config.precision_byte;
 
   system_config.exit_out_of_memory = config["simulation"]["exit_out_of_memory"].as<bool>();
   system_config.mem_cap_limit = config["simulation"]["mem_cap_limit"].as<bool>();
@@ -207,6 +244,19 @@ int main(int argc, char *argv[]) {
     expert_file_path = "none";
     model_config.input_len = input_len;
     model_config.output_len = output_len;
+
+    // CAG: remainder of the context window beyond ISL+OSL is the shared
+    // pre-computed KV cache (paper Sec. IV-A.2), read by every sequence.
+    if (context_window > 0) {
+      assertTrue(context_window > input_len + output_len,
+                "context_window must exceed input_len + output_len");
+      model_config.shared_kv_cache_len = context_window - input_len - output_len;
+      if (model_config.context_parallel_degree > 1) {
+        assertTrue(model_config.shared_kv_cache_len %
+                      model_config.context_parallel_degree == 0,
+                  "shared_kv_cache_len must be divisible by context_parallel_degree");
+      }
+    }
   } else {
     expert_file_path =
         "../expert_data/experts_" + model_name + "_" + data_name + ".csv";
@@ -229,7 +279,7 @@ int main(int argc, char *argv[]) {
 
   Model model(model_config, cluster, scheduler);
 
-  bool out_of_memory = cluster->checkMemorySize();
+  bool out_of_memory = use_hbf ? cluster->checkH3MemorySize() : cluster->checkMemorySize();
   cluster->set_dependency();
 
   std::cout << "-----------------------------------" << std::endl;
@@ -353,6 +403,79 @@ int main(int argc, char *argv[]) {
     TopModuleGraph::Ptr top0 = cluster->get_device(0)->top_module_graph;
     top0->print_timeboard();
   }
+
+  // H3: static per-device TDP, used to turn the throughput already in
+  // stat_list/the exported CSV (tokens/time, from Stat.process_token and
+  // Stat.latency) into throughput-per-power (paper Fig. 6). TDP is a
+  // constant draw independent of access pattern, so unlike the DRAM
+  // access-energy model it is computed once here rather than accumulated
+  // during simulation.
+  double per_device_power_watts =
+      system_config.gpu_tdp +
+      system_config.num_cube * system_config.hbm_tdp_per_cube +
+      (system_config.use_hbf
+           ? system_config.num_hbf_cube * system_config.hbf_tdp_per_cube
+           : 0.0);
+  double total_power_watts = num_device * num_node * per_device_power_watts;
+  std::cout << "H3: per-device power " << per_device_power_watts
+            << " W, total system power " << total_power_watts << " W"
+            << std::endl;
+
+  // H3: aggregate throughput from stat_list and append one row to
+  // results.log, so a comparison across HBM-only vs H3 runs (batch size,
+  // throughput, throughput-per-power) can be reconstructed later without
+  // re-parsing every run's stdout/CSV by hand. See extract_results.py.
+  // Only "t2t" entries are the per-decode-step stats (one per scheduler
+  // tick that actually processed a batch; runIteration's stat_list also
+  // carries "e2e"/"sum" bookkeeping entries from addLatency() with
+  // unrelated semantics). Stat.time is cumulative simulated time since
+  // the run started, not this step's duration -- Stat.latency is the
+  // actual per-step device time, so tokens/latency (summed and averaged
+  // across steps) is the correct steady-state decode throughput.
+  long long total_tokens = 0;
+  time_ns total_latency = 0;
+  for (const Stat& s : stat_list) {
+    if (s.type != "t2t") {
+      continue;
+    }
+    total_tokens += s.process_token;
+    total_latency += s.latency;
+  }
+  double throughput_tps = total_latency > 0 ? total_tokens / (total_latency / 1.0e9) : 0.0;
+  double throughput_per_power =
+      total_power_watts > 0 ? throughput_tps / total_power_watts : 0.0;
+
+  std::string results_log_path = "../results.log";
+  bool write_header = !std::ifstream(results_log_path).good();
+  std::ofstream results_log(results_log_path, std::ios::app);
+  if (write_header) {
+    results_log << "timestamp,model,gpu_gen,use_hbf,hbf_bandwidth_scale,"
+                   "num_node,num_device,ne_tp_dg,context_parallel_degree,"
+                   "fp8_compute_doubling,context_window,input_len,"
+                   "output_len,requested_max_batch_size,final_max_batch_size,"
+                   "throughput_tps,per_device_power_w,total_power_w,"
+                   "throughput_per_power\n";
+  }
+  results_log << std::time(nullptr) << ","
+              << model_name << ","
+              << gpu_gen << ","
+              << use_hbf << ","
+              << system_config.hbf_bandwidth_scale << ","
+              << num_node << ","
+              << num_device << ","
+              << model_config.ne_tp_dg << ","
+              << model_config.context_parallel_degree << ","
+              << fp8_compute_doubling << ","
+              << context_window << ","
+              << input_len << ","
+              << output_len << ","
+              << max_batch_size << ","
+              << scheduler->total_batch_size << ","
+              << throughput_tps << ","
+              << per_device_power_watts << ","
+              << total_power_watts << ","
+              << throughput_per_power << "\n";
+  results_log.close();
 
   return 0;
 }

@@ -21,6 +21,25 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
   Tensor_Ptr k_cache = tensor.at(1);
   Tensor_Ptr v_cache = tensor.at(2);
 
+  // H3/CAG: when present, tensor.at(3)/(4) are the shared pre-computed
+  // KV cache tensors (one handle each, aggregating bytes across all
+  // KV heads), read once per iteration by the whole batch instead of
+  // once per sequence -- see attention.cpp's *Gen constructors.
+  bool cag = tensor.size() > 3;
+  Tensor_Ptr k_cache_shared = cag ? tensor.at(3) : nullptr;
+  Tensor_Ptr v_cache_shared = cag ? tensor.at(4) : nullptr;
+  // H3: this device only attends to its 1/context_parallel_degree slice of
+  // the shared cache (see attention.cpp's SelfAttentionGen constructor,
+  // which sizes k/v_cache_shared identically) -- the cross-device combine
+  // of these partial results happens afterward in SelfAttentionParallel.
+  int shared_kv_cache_len =
+      cag ? device->model_config.shared_kv_cache_len /
+                device->model_config.context_parallel_degree
+          : 0;
+  // KV cache bytes (private + shared) can run at a different precision
+  // than activation bytes (Q reads, score matrix) -- see model_config.h.
+  int kv_precision = device->model_config.kv_cache_precision_byte;
+
   auto config = device->config;
   hw_metric compute_peak_flops = config.compute_peak_flops;
   hw_metric memory_bandwidth = config.memory_bandwidth;
@@ -62,13 +81,19 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
 
     m = seq->num_process_token;
     k = head_dim;
-    n = seq->current_len + seq->num_process_token;
+    int n_private = seq->current_len + seq->num_process_token;
+    n = n_private + shared_kv_cache_len; // full context attended to (compute doesn't shrink under CAG)
 
     for (int kv_idx = 0; kv_idx < num_kv_heads; kv_idx++) {
       flops = m * k * n * 2.0 * attention_group_size;
       total_flops += flops;
 
-      memory_size = 1.0 * (m * k * num_heads / num_kv_heads + k * n + m * n * num_heads / num_kv_heads) * input->precision_byte;
+      // Q read + attn-score-output bytes scale with the full context (real
+      // activation sizes, activation precision); K-cache read bytes here
+      // are the private portion only (HBM, KV-cache precision) -- the
+      // shared portion is charged once below (HBF).
+      memory_size = 1.0 * (m * k * num_heads / num_kv_heads + m * n * num_heads / num_kv_heads) * input->precision_byte
+                   + 1.0 * k * n_private * kv_precision;
       total_memory_size += memory_size;
 
       compute_duration = flops / compute_peak_flops * 1000 * 1000 * 1000;
@@ -78,7 +103,19 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
       memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
       accumul_memory_duration += memory_duration;
     }
-    accumul_len += n;
+    accumul_len += n_private;
+  }
+
+  time_ns shared_memory_duration = 0;
+  if (cag) {
+    hw_metric shared_memory_size = 1.0 * num_kv_heads * head_dim * shared_kv_cache_len * kv_precision;
+    total_memory_size += shared_memory_size;
+    k_cache_shared->setShape({shared_kv_cache_len, head_dim * num_kv_heads});
+    ExecStatus temp = getIdealMemoryStatus(device, ProcessorType::GPU, DRAMRequestType::kRead, k_cache_shared);
+    exec_status += temp;
+    hw_metric shared_hbm_bytes = k_cache_shared->in_hbf ? 0 : shared_memory_size;
+    hw_metric shared_hbf_bytes = k_cache_shared->in_hbf ? shared_memory_size : 0;
+    shared_memory_duration = h3MemoryDuration(config, shared_hbm_bytes, shared_hbf_bytes);
   }
 
   if (use_ramulator) {
@@ -98,7 +135,7 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
   }
 
   exec_status.total_duration +=
-      std::max(accumul_compute_duration, accumul_memory_duration);
+      std::max(accumul_compute_duration, accumul_memory_duration + shared_memory_duration);
 
   // Softmax //
   for (int seq_idx = 0; seq_idx < num_seq; seq_idx++) {
@@ -108,7 +145,7 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
     seq = seq_list.at(seq_idx);
 
     m = seq->num_process_token;
-    n = seq->current_len + seq->num_process_token;
+    n = seq->current_len + seq->num_process_token + shared_kv_cache_len; // softmax over the full attended context
 
     flops = 7.0 * m * n * num_heads; // scale + mask + softmax
     total_flops += flops;
@@ -126,14 +163,19 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
     seq = seq_list.at(seq_idx);
 
     m = seq->num_process_token;
-    k = seq->current_len + seq->num_process_token;
+    int k_private = seq->current_len + seq->num_process_token;
+    k = k_private + shared_kv_cache_len; // full context attended to
     n = head_dim;
 
     for (int kv_idx = 0; kv_idx < num_kv_heads; kv_idx++) {
       flops = m * k * n * 2.0 * attention_group_size;
       total_flops += flops;
 
-      memory_size = 1.0 * (m * k * num_heads / num_kv_heads + k * n + m * n * num_heads / num_kv_heads) * input->precision_byte;
+      // attn-score read bytes scale with the full context (real activation
+      // size, activation precision); V-cache read bytes here are the
+      // private portion only (HBM, KV-cache precision).
+      memory_size = 1.0 * (m * k * num_heads / num_kv_heads + m * n * num_heads / num_kv_heads) * input->precision_byte
+                   + 1.0 * k_private * n * kv_precision;
       total_memory_size += memory_size;
 
       compute_duration = flops / compute_peak_flops * 1000 * 1000 * 1000;
@@ -143,7 +185,19 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
       memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
       accumul_memory_duration += memory_duration;
     }
-    accumul_len += k;
+    accumul_len += k_private;
+  }
+
+  shared_memory_duration = 0;
+  if (cag) {
+    hw_metric shared_memory_size = 1.0 * num_kv_heads * shared_kv_cache_len * head_dim * kv_precision;
+    total_memory_size += shared_memory_size;
+    v_cache_shared->setShape({shared_kv_cache_len, head_dim * num_kv_heads});
+    ExecStatus temp = getIdealMemoryStatus(device, ProcessorType::GPU, DRAMRequestType::kRead, v_cache_shared);
+    exec_status += temp;
+    hw_metric shared_hbm_bytes = v_cache_shared->in_hbf ? 0 : shared_memory_size;
+    hw_metric shared_hbf_bytes = v_cache_shared->in_hbf ? shared_memory_size : 0;
+    shared_memory_duration = h3MemoryDuration(config, shared_hbm_bytes, shared_hbf_bytes);
   }
 
   if (use_ramulator) {
@@ -154,7 +208,7 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
                        DRAMRequestType::kRead, PIMOperandType::kDRAM, v_cache);
     exec_status += temp;
     accumul_memory_duration = temp.memory_duration;
-  }  
+  }
   else {
     v_cache->setShape({accumul_len, head_dim * num_kv_heads});
     ExecStatus temp;
@@ -163,7 +217,7 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
   }
 
   exec_status.total_duration +=
-      std::max(accumul_compute_duration, accumul_memory_duration);
+      std::max(accumul_compute_duration, accumul_memory_duration + shared_memory_duration);
 
   exec_status.compute_util = 1000.0 * 1000.0 * 1000.0 * total_flops /
                              compute_peak_flops / exec_status.total_duration;

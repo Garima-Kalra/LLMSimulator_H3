@@ -13,15 +13,26 @@ add_subdirectory(src)
 add_subdirectory(eval)
 
 
-target_link_libraries(
-    llm_system
-    PRIVATE hardware
-    PRIVATE -Wl,--whole-archive dram -Wl,--no-whole-archive 
-    #PRIVATE dram
-    PRIVATE module
-    PRIVATE model
-    PRIVATE scheduler
-)
+if(APPLE)
+  target_link_libraries(
+      llm_system
+      PRIVATE hardware
+      PRIVATE -Wl,-all_load dram
+      PRIVATE module
+      PRIVATE model
+      PRIVATE scheduler
+  )
+else()
+  target_link_libraries(
+      llm_system
+      PRIVATE hardware
+      PRIVATE -Wl,--whole-archive dram -Wl,--no-whole-archive
+      #PRIVATE dram
+      PRIVATE module
+      PRIVATE model
+      PRIVATE scheduler
+  )
+endif()
 
 set(EXECUTABLE_OUTPUT_PATH ${CMAKE_BINARY_DIR})
 

@@ -84,8 +84,29 @@ class ModelConfig {
   int e_tp_dg;   // expert tensor parallelism degree
   std::string dataset;
 
+  // H3 / CAG: context-parallel sub-degree within ne_tp_dg, used only by
+  // attention's KV-head sharding. head_tp_dg = ne_tp_dg / context_parallel_degree
+  // devices jointly own one whole KV head (as before); the extra
+  // context_parallel_degree devices in that group instead split the shared
+  // CAG cache length, enabling ne_tp_dg to exceed num_kv_heads. 1 = today's
+  // behavior (no context parallelism).
+  int context_parallel_degree = 1;
+
   int input_len;
   int output_len;
+
+  // H3 / CAG: length of a shared, read-only pre-computed KV cache that is
+  // attended to by every sequence in the batch (Section II-A). Placed in
+  // HBF when use_hbf is on. 0 disables CAG (no shared cache).
+  int shared_kv_cache_len = 0;
+
+  // KV cache (private + shared) can run at a different precision than
+  // weights/activations -- e.g. the H3 paper's own numbers only work out
+  // to FP8 (1B) weights + FP16 (2B) KV cache (405GB weights matches FP8;
+  // "approximately 540GB" for a 1M-token shared cache only matches 2B/elem,
+  // not 1B). Defaults to precision_byte for backward compatibility (set
+  // explicitly in eval/test.cpp when they should differ).
+  int kv_cache_precision_byte = 0;  // 0 = "use precision_byte", set at runtime
 };
 
 static ModelConfig mixtral = ModelConfig(4096, 128, 32, 32, 8, 32768, 14336,

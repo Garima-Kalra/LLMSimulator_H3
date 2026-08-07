@@ -50,7 +50,15 @@ class SystemConfig {
                  bool use_inject_rate = false,
                  int request_per_second = 10,
                  int num_cube = 5,
-                 int num_logic_cube = 5
+                 int num_logic_cube = 5,
+                 bool use_hbf = false,
+                 hw_metric hbf_bandwidth = 8.000 * 1000 * 1000 * 1000 * 1000,
+                 hw_metric hbf_capacity = 3.0 * 1024 * 1024 * 1024 * 1024,
+                 int num_hbf_cube = 8,
+                 hw_metric hbf_bandwidth_scale = 1.0,
+                 hw_metric gpu_tdp = 680.0,
+                 hw_metric hbm_tdp_per_cube = 40.0,
+                 hw_metric hbf_tdp_per_cube = 160.0
                 )
       : gpu_gen(gpu_gen),
         num_node(num_node),
@@ -86,7 +94,15 @@ class SystemConfig {
         use_inject_rate(use_inject_rate),
         request_per_second(request_per_second),
         num_cube(num_cube),
-        num_logic_cube(num_logic_cube){
+        num_logic_cube(num_logic_cube),
+        use_hbf(use_hbf),
+        hbf_bandwidth(hbf_bandwidth),
+        hbf_capacity(hbf_capacity),
+        num_hbf_cube(num_hbf_cube),
+        hbf_bandwidth_scale(hbf_bandwidth_scale),
+        gpu_tdp(gpu_tdp),
+        hbm_tdp_per_cube(hbm_tdp_per_cube),
+        hbf_tdp_per_cube(hbf_tdp_per_cube){
           logic_memory_bandwidth = memory_bandwidth * logic_x;
           pim_memory_bandwidth = memory_bandwidth * pim_x;
         };
@@ -157,6 +173,24 @@ class SystemConfig {
   int num_cube; //8: for HBM3E (B100), 5 for HBM3 (H100)
   int num_logic_cube;
   // Device
+
+  // H3: High Bandwidth Flash (HBF) specification
+  // read-only data (weights, shared pre-computed KV cache) is placed here
+  // when use_hbf is on; HBF is modeled as ideal/bandwidth-bound only
+  // (NAND access latency is assumed hidden by the Latency Hiding Buffer,
+  // per the H3 paper -- no Ramulator2/cycle-accurate path is supported).
+  bool use_hbf;
+  hw_metric hbf_bandwidth;       // B/s
+  hw_metric hbf_capacity;        // bytes
+  int num_hbf_cube;
+  hw_metric hbf_bandwidth_scale; // sensitivity knob, e.g. 0.5 for halved HBF bandwidth
+
+  // Static per-device TDP (W), used for throughput-per-power only.
+  // This is independent of the DRAM per-op access-energy model in
+  // dram/power.h -- cube TDP is drawn regardless of access pattern.
+  hw_metric gpu_tdp;
+  hw_metric hbm_tdp_per_cube;
+  hw_metric hbf_tdp_per_cube;
 };
 
 
@@ -311,5 +345,27 @@ static SystemConfig B200 = SystemConfig(
                  8,                                 // num_cube
                  8                                  // int num_logic_cube
                  );
+
+// H3: B200 + High Bandwidth Flash.
+// HBF specs per H3 paper (Sec. IV-A / Fig. 3(c)): 3TB capacity (16x
+// HBM3E's 24GB/cube, 8 cubes x 384GB = 3TB), 8TB/s bandwidth (same as
+// HBM3E), 160W TDP per cube (vs. 40W/cube for HBM3E). GPU TDP (680W) is
+// the package TDP without HBM/HBF, per paper Sec. IV-B.3.
+static SystemConfig B200_H3 = [] {
+  SystemConfig config = B200;
+  // NOTE: gpu_gen intentionally stays "B200" (not "B200_H3") -- it is used
+  // elsewhere (e.g. Device::Device in device.cpp) as a key to select the
+  // HBM3E dram_config yaml / MemoryConfig preset, which is unaffected by
+  // HBF; use_hbf is the correct discriminator for H3-specific behavior.
+  config.use_hbf = true;
+  config.hbf_bandwidth = 8.000 * 1000 * 1000 * 1000 * 1000;
+  config.hbf_capacity = 3.0 * 1024 * 1024 * 1024 * 1024;
+  config.num_hbf_cube = 8;
+  config.hbf_bandwidth_scale = 1.0;
+  config.gpu_tdp = 680.0;
+  config.hbm_tdp_per_cube = 40.0;
+  config.hbf_tdp_per_cube = 160.0;
+  return config;
+}();
 
 }  // namespace llm_system
