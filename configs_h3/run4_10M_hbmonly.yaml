@@ -48,7 +48,7 @@ simulation:
   mem_cap_limit: on
 
 log:
-  print_log: on
+  print_log: off
   export_gantt: off
   output_directory: ../data/
   gantt_directory: ./gantt

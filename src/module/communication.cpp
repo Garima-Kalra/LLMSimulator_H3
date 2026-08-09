@@ -2,6 +2,9 @@
 #include "scheduler/scheduler.h"
 
 #include "common/assert.h"
+
+#include <algorithm>
+#include <set>
 // AllReduce //
 
 namespace llm_system {
@@ -27,14 +30,52 @@ Tensor::Ptr AllReduce::forward(const Tensor::Ptr input,
     return output;
   }
 
-  int hop = (device_list.size() - 1) * 2;
-  size /= device_list.size();
+  // Topology-aware ring all-reduce. device_list holds contiguous global
+  // ranks, so a rank's node is rank / num_device (devices per node).
+  // Previously this always used device_ict (NVLink) bandwidth even when the
+  // group spanned nodes, which silently gave 32-GPU/4-node collectives
+  // scale-up bandwidth. The paper models the opposite (Sec. IV-A.4: at 10M,
+  // "communication between GPU servers occurs through a scale-out fabric
+  // (e.g., InfiniBand) rather than a scale-up fabric (e.g., NVLink)").
+  const int num_group_device = (int)device_list.size();
+  const int device_per_node =
+      device->config.num_device > 0 ? device->config.num_device : 1;
+  std::set<int> spanned_nodes;
+  for (int rank : device_list) {
+    spanned_nodes.insert(rank / device_per_node);
+  }
+  const int num_span_node = std::max(1, (int)spanned_nodes.size());
+  const int group_per_node = std::max(1, num_group_device / num_span_node);
 
-  time_ns one_hop =
-      device->config.device_ict_latency +
-      size / device->config.device_ict_bandwidth * 1000 * 1000 * 1000;
-
-  time_ns total_time = one_hop * hop;
+  time_ns total_time = 0;
+  if (num_span_node == 1) {
+    // Single NVLink domain -- unchanged behavior.
+    int hop = (num_group_device - 1) * 2;
+    hw_metric step = 1.0 * size / num_group_device;
+    total_time = (device->config.device_ict_latency +
+                  step / device->config.device_ict_bandwidth * 1000 * 1000 * 1000) *
+                 hop;
+  } else if (device->config.allreduce_hierarchical) {
+    // Reduce-scatter within node -> ring across nodes -> all-gather within
+    // node. Only size/group_per_node ever crosses the scale-out fabric.
+    int intra_hop = (group_per_node - 1) * 2;
+    int inter_hop = (num_span_node - 1) * 2;
+    hw_metric intra_step = 1.0 * size / group_per_node;
+    hw_metric inter_step = 1.0 * size / group_per_node / num_span_node;
+    total_time =
+        intra_hop * (device->config.device_ict_latency +
+                     intra_step / device->config.device_ict_bandwidth * 1000 * 1000 * 1000) +
+        inter_hop * (device->config.node_ict_latency +
+                     inter_step / device->config.node_ict_bandwidth * 1000 * 1000 * 1000);
+  } else {
+    // Flat ring across nodes: steps are synchronous, so every step is gated
+    // by the slowest link present, which is the inter-node fabric.
+    int hop = (num_group_device - 1) * 2;
+    hw_metric step = 1.0 * size / num_group_device;
+    total_time = (device->config.node_ict_latency +
+                  step / device->config.node_ict_bandwidth * 1000 * 1000 * 1000) *
+                 hop;
+  }
 
   if (input->parallel_execution && !device->config.communication_hiding) {
     if (input->isPerformHigh()) {

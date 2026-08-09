@@ -50,11 +50,22 @@ def fmt_x(context_window):
     return f"{context_window // 1_000_000}M" if context_window >= 1_000_000 else str(context_window)
 
 
-def get(rows, context_window, use_hbf, scale):
-    for r in rows:
-        if (r["context_window"] == context_window and r["use_hbf"] == use_hbf
-                and r["hbf_bandwidth_scale"] == scale):
-            return r
+def get(rows, context_window, use_hbf, scale, amortized=True):
+    """Fetch one run. `amortized` selects the attention cost model: True =
+    shared-context work charged once per batch (paper-aligned), False =
+    charged per sequence (this codebase's original model). Within the
+    requested mode, prefers the calibrated run (hbm_reserve_fraction > 0)
+    since that is the headline configuration; falls back to uncalibrated,
+    then to the other cost model only if nothing else was run."""
+    cands = [r for r in rows
+             if r["context_window"] == context_window
+             and r["use_hbf"] == use_hbf
+             and r["hbf_bandwidth_scale"] == scale]
+    for want in (amortized, not amortized):
+        pool = [r for r in cands if r["cag_amortize_shared_compute"] == want]
+        if pool:
+            return max(pool, key=lambda r: (r["hbm_reserve_fraction"],
+                                            r["allreduce_hierarchical"]))
     return None
 
 
@@ -150,23 +161,36 @@ def plot_fig6(rows, contexts):
     bar_h = 0.17
     for ax, (field, paper_key, paper_key_half, xlabel) in zip(axes, metrics):
         y_positions = list(range(len(contexts)))
+        # (label, color, use_hbf, scale, paper_key, amortized)
         series = [
-            ("Simulated H3 (full HBF BW)", BLUE, True, 1.0, paper_key),
-            ("Simulated H3 (1/2 HBF BW)", AQUA, True, 0.5, paper_key_half),
-            ("Paper (reported, full BW)", ORANGE, None, None, paper_key),
+            ("Simulated H3 (full HBF BW)", BLUE, True, 1.0, paper_key, True),
+            ("Simulated H3 (1/2 HBF BW)", AQUA, True, 0.5, paper_key_half, True),
+            ("Simulated H3 (full BW, per-seq cost model)", INK_MUTED, True, 1.0,
+             paper_key, False),
+            ("Paper (reported, full BW)", ORANGE, None, None, paper_key, None),
         ]
         if paper_key_half is not None:
-            series.append(("Paper (reported, 1/2 BW)", "#c9803f", None, None, paper_key_half))
+            series.append(("Paper (reported, 1/2 BW)", "#c9803f", None, None,
+                           paper_key_half, None))
 
-        for i, (label, color, use_hbf, scale, series_paper_key) in enumerate(series):
+        for i, (label, color, use_hbf, scale, series_paper_key, amort) in enumerate(series):
             offsets = [y - bar_h * (len(series) - 1) / 2 + i * bar_h for y in y_positions]
             vals, missing = [], []
             for ctx in contexts:
                 if use_hbf is None:
                     ratio = PAPER.get(ctx, {}).get(series_paper_key) if series_paper_key else None
                 else:
-                    hbm = get(rows, ctx, False, 1.0)
-                    h3 = get(rows, ctx, True, scale)
+                    hbm = get(rows, ctx, False, 1.0, amort)
+                    h3 = get(rows, ctx, True, scale, amort)
+                    # only compare runs sharing the same cost model
+                    if (hbm and h3 and (
+                            hbm["cag_amortize_shared_compute"]
+                            != h3["cag_amortize_shared_compute"]
+                            or hbm["hbm_reserve_fraction"]
+                            != h3["hbm_reserve_fraction"]
+                            or hbm["allreduce_hierarchical"]
+                            != h3["allreduce_hierarchical"])):
+                        hbm = None
                     ratio = (h3[field] / hbm[field]) if (hbm and h3 and hbm[field] > 0) else None
                 vals.append(ratio if ratio is not None else 0)
                 missing.append(ratio is None)
@@ -202,7 +226,7 @@ def plot_fig6(rows, contexts):
         h, l = ax.get_legend_handles_labels()
         for handle, label in zip(h, l):
             seen.setdefault(label, handle)
-    fig.legend(seen.values(), seen.keys(), loc="upper center", ncol=4, frameon=False,
+    fig.legend(seen.values(), seen.keys(), loc="upper center", ncol=3, frameon=False,
               bbox_to_anchor=(0.5, 1.06), fontsize=9)
     fig.suptitle("H3 vs. HBM-only: Throughput & Throughput/Power (cf. paper Fig. 6)",
                  fontsize=14, color=INK, y=1.14)

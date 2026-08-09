@@ -47,7 +47,9 @@ PAPER = {
 FIELDS = [
     "timestamp", "model", "gpu_gen", "use_hbf", "hbf_bandwidth_scale",
     "num_node", "num_device", "ne_tp_dg", "context_parallel_degree",
-    "fp8_compute_doubling", "context_window", "input_len",
+    "fp8_compute_doubling", "cag_amortize_shared_compute",
+    "hbm_reserve_fraction", "allreduce_hierarchical",
+    "context_window", "input_len",
     "output_len", "requested_max_batch_size", "final_max_batch_size",
     "throughput_tps", "per_device_power_w", "total_power_w",
     "throughput_per_power",
@@ -61,6 +63,12 @@ def load_rows(path):
         for row in reader:
             row["use_hbf"] = bool(int(row["use_hbf"]))
             row["fp8_compute_doubling"] = bool(int(row.get("fp8_compute_doubling", 1)))
+            row["cag_amortize_shared_compute"] = bool(
+                int(row.get("cag_amortize_shared_compute") or 0))
+            row["hbm_reserve_fraction"] = float(
+                row.get("hbm_reserve_fraction") or 0.0)
+            row["allreduce_hierarchical"] = bool(
+                int(row.get("allreduce_hierarchical") or 0))
             for key in ("hbf_bandwidth_scale", "throughput_tps",
                         "per_device_power_w", "total_power_w",
                         "throughput_per_power"):
@@ -84,15 +92,23 @@ def scenario_key(row):
     total device count (num_node * num_device), not num_device alone --
     the 10M scenario spans multiple nodes (e.g. num_node=4, num_device=8 =
     32 total), and num_device alone would collide with an unrelated
-    single-node, 8-total-device scenario."""
-    return (row["model"], row["context_window"], row["total_device"])
+    single-node, 8-total-device scenario. cag_amortize_shared_compute is part
+    of the key too: it changes the attention cost model for BOTH the HBM-only
+    baseline and H3, so the two modes form separate, self-consistent
+    comparisons and must never share a baseline."""
+    return (row["model"], row["context_window"], row["total_device"],
+            row["cag_amortize_shared_compute"], row["hbm_reserve_fraction"],
+            row["allreduce_hierarchical"])
 
 
 def pick_latest(rows):
-    """If a scenario was rerun, keep only the most recent row per exact config."""
+    """If a scenario was rerun, keep only the most recent row per exact config.
+    fp8_compute_doubling is part of the key so the FP8-doubling-off sensitivity
+    run doesn't silently overwrite the primary (doubling-on) comparison row."""
     latest = {}
     for row in rows:
-        key = (scenario_key(row), row["use_hbf"], row["hbf_bandwidth_scale"])
+        key = (scenario_key(row), row["use_hbf"], row["hbf_bandwidth_scale"],
+               row["fp8_compute_doubling"])
         if key not in latest or row["timestamp"] > latest[key]["timestamp"]:
             latest[key] = row
     return list(latest.values())
@@ -129,19 +145,29 @@ def main():
 
     print(f"Loaded {len(rows)} run(s) from {path}\n")
 
-    for key in sorted(groups, key=lambda k: (k[0], k[1], k[2])):
-        model, context_window, total_device = key
+    for key in sorted(groups, key=lambda k: (k[3], k[4], k[5], k[0], k[1], k[2])):
+        (model, context_window, total_device, amortized, reserve,
+         hier_ar) = key
         scenario_rows = groups[key]
         baseline = next((r for r in scenario_rows if not r["use_hbf"]), None)
         h3_variants = sorted(
             (r for r in scenario_rows if r["use_hbf"]),
-            key=lambda r: r["hbf_bandwidth_scale"],
+            key=lambda r: (r["hbf_bandwidth_scale"], r["fp8_compute_doubling"]),
             reverse=True,
         )
 
+        mode = ("shared-attention compute AMORTIZED per batch (paper-aligned)"
+                if amortized else
+                "shared-attention compute per-sequence (codebase original)")
+        if reserve:
+            mode += f"; HBM reserve {reserve:.2%} (CALIBRATED)"
+        if total_device > 8:
+            mode += ("; hierarchical all-reduce" if hier_ar
+                     else "; flat-ring all-reduce over scale-out fabric")
         print("=" * 78)
         print(f"Scenario: {model}, context_window={context_window:,}, "
               f"total_device={total_device}")
+        print(f"  cost model: {mode}")
         print("=" * 78)
 
         if baseline is None:
@@ -162,6 +188,8 @@ def main():
         for h3 in h3_variants:
             scale_tag = ("full HBF bandwidth" if h3["hbf_bandwidth_scale"] == 1.0
                          else f"{h3['hbf_bandwidth_scale']:g}x HBF bandwidth")
+            if not h3["fp8_compute_doubling"]:
+                scale_tag += ", FP8-doubling OFF (sensitivity check)"
             print(f"  H3 ({scale_tag}): "
                   f"batch={h3['final_max_batch_size']:>6}  "
                   f"throughput={fmt_num(h3['throughput_tps']):>10} tok/s  "

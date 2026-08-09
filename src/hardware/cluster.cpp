@@ -274,16 +274,21 @@ bool Cluster::checkMemorySize() {
             device->model_config.num_kv_heads / head_tp_dg *
             device->model_config.kv_cache_precision_byte;
       }
+      // Capacity actually offerable to the KV-cache pool: HBM minus the
+      // reserved fraction (framework/workspace/fragmentation). At the
+      // default hbm_reserve_fraction=0 this is exactly memory_capacity.
+      hw_metric usable_capacity =
+          config.memory_capacity * (1.0 - config.hbm_reserve_fraction);
       hw_metric avail_capacity = 0;
       if(device->model_config.q_lora_rank == 0){
         avail_capacity =
-            config.memory_capacity -
+            usable_capacity -
             (size_vector.at(0) / device->model_config.num_layers) -
             size_vector.at(1) - size_vector.at(3);
       }
       else{
         avail_capacity =
-            config.memory_capacity - activation_size - size_vector.at(1) - size_vector.at(3);
+            usable_capacity - activation_size - size_vector.at(1) - size_vector.at(3);
       }
 
       if (avail_capacity < 0) {
@@ -338,7 +343,7 @@ bool Cluster::checkHeteroMemorySize() {
           device->model_config.num_kv_heads / device->model_config.ne_tp_dg *
           device->model_config.precision_byte;
 
-      hw_metric avail_capacity = config.memory_capacity - (size_vector.at(0) / device->model_config.num_layers) -
+      hw_metric avail_capacity = config.memory_capacity * (1.0 - config.hbm_reserve_fraction) - (size_vector.at(0) / device->model_config.num_layers) -
         size_vector.at(1);
       if (avail_capacity < 0) {
         fail("Memory capacity is smaller than model weight");
@@ -421,7 +426,8 @@ bool Cluster::checkH3MemorySize() {
       }
 
       hw_metric avail_capacity =
-          config.memory_capacity - (size_vector.at(0) / device->model_config.num_layers);
+          config.memory_capacity * (1.0 - config.hbm_reserve_fraction) -
+          (size_vector.at(0) / device->model_config.num_layers);
 
       if (avail_capacity < 0) {
         fail("Memory capacity is smaller than activation size");

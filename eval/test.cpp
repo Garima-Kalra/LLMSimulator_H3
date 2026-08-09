@@ -67,6 +67,15 @@ int main(int argc, char *argv[]) {
 
   system_config.hbf_bandwidth_scale =
       config["system"]["hbf_bandwidth_scale"].as<double>();
+  // Per-device HBM held back from the KV-cache pool (framework/workspace/
+  // fragmentation). Default 0 = unchanged behavior. See ASSUMPTIONS.md --
+  // this is CALIBRATED against the paper's Fig. 5 batch ratios, not derived.
+  system_config.hbm_reserve_fraction =
+      config["system"]["hbm_reserve_fraction"].as<double>(0.0);
+  // Multi-node AllReduce model: false = flat ring gated by the inter-node
+  // fabric (paper's stated "ring all-reduce"); true = hierarchical/NCCL-style.
+  system_config.allreduce_hierarchical =
+      config["system"]["allreduce_hierarchical"].as<bool>(false);
 
   // NVLink Config // 
   if(config["system"]["nvlink_gen"].as<int>() == 4){
@@ -251,6 +260,10 @@ int main(int argc, char *argv[]) {
       assertTrue(context_window > input_len + output_len,
                 "context_window must exceed input_len + output_len");
       model_config.shared_kv_cache_len = context_window - input_len - output_len;
+      // H3/CAG: charge the shared context's attention work once per batch
+      // rather than per sequence (paper Sec. II-A). See ASSUMPTIONS.md.
+      model_config.cag_amortize_shared_compute =
+          config["simulation"]["cag_amortize_shared_compute"].as<bool>(false);
       if (model_config.context_parallel_degree > 1) {
         assertTrue(model_config.shared_kv_cache_len %
                       model_config.context_parallel_degree == 0,
@@ -451,7 +464,9 @@ int main(int argc, char *argv[]) {
   if (write_header) {
     results_log << "timestamp,model,gpu_gen,use_hbf,hbf_bandwidth_scale,"
                    "num_node,num_device,ne_tp_dg,context_parallel_degree,"
-                   "fp8_compute_doubling,context_window,input_len,"
+                   "fp8_compute_doubling,cag_amortize_shared_compute,"
+                   "hbm_reserve_fraction,allreduce_hierarchical,"
+                   "context_window,input_len,"
                    "output_len,requested_max_batch_size,final_max_batch_size,"
                    "throughput_tps,per_device_power_w,total_power_w,"
                    "throughput_per_power\n";
@@ -466,6 +481,9 @@ int main(int argc, char *argv[]) {
               << model_config.ne_tp_dg << ","
               << model_config.context_parallel_degree << ","
               << fp8_compute_doubling << ","
+              << model_config.cag_amortize_shared_compute << ","
+              << system_config.hbm_reserve_fraction << ","
+              << system_config.allreduce_hierarchical << ","
               << context_window << ","
               << input_len << ","
               << output_len << ","

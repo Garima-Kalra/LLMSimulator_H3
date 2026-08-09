@@ -58,7 +58,12 @@ class SystemConfig {
                  hw_metric hbf_bandwidth_scale = 1.0,
                  hw_metric gpu_tdp = 680.0,
                  hw_metric hbm_tdp_per_cube = 40.0,
-                 hw_metric hbf_tdp_per_cube = 160.0
+                 hw_metric hbf_tdp_per_cube = 160.0,
+                 // Fraction of HBM per device held back from the KV-cache
+                 // pool (framework/CUDA context, comm + kernel workspace,
+                 // allocator fragmentation). 0 = today's behavior: every
+                 // byte not holding weights/shared-cache is usable for KV.
+                 hw_metric hbm_reserve_fraction = 0.0
                 )
       : gpu_gen(gpu_gen),
         num_node(num_node),
@@ -102,7 +107,8 @@ class SystemConfig {
         hbf_bandwidth_scale(hbf_bandwidth_scale),
         gpu_tdp(gpu_tdp),
         hbm_tdp_per_cube(hbm_tdp_per_cube),
-        hbf_tdp_per_cube(hbf_tdp_per_cube){
+        hbf_tdp_per_cube(hbf_tdp_per_cube),
+        hbm_reserve_fraction(hbm_reserve_fraction){
           logic_memory_bandwidth = memory_bandwidth * logic_x;
           pim_memory_bandwidth = memory_bandwidth * pim_x;
         };
@@ -191,6 +197,19 @@ class SystemConfig {
   hw_metric gpu_tdp;
   hw_metric hbm_tdp_per_cube;
   hw_metric hbf_tdp_per_cube;
+  // See constructor comment. Applied wherever KV-cache headroom is computed
+  // (Cluster::checkMemorySize / checkH3MemorySize) -- never to the raw
+  // weights/shared-cache fit check, which is a hard physical limit.
+  hw_metric hbm_reserve_fraction;
+
+  // Collective model for tensor-parallel AllReduce when the device group
+  // spans more than one node. false = flat ring (the paper's stated
+  // assumption, Sec. IV-A.1 "ring all-reduce"): synchronous steps, so every
+  // step is gated by the slowest link in the ring, i.e. the inter-node
+  // fabric. true = hierarchical / NCCL-style (reduce-scatter within node ->
+  // ring across nodes -> all-gather within node), which keeps most traffic
+  // on NVLink. Single-node groups are unaffected either way.
+  bool allreduce_hierarchical = false;
 };
 
 

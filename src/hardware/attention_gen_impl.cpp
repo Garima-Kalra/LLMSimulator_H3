@@ -39,6 +39,11 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
   // KV cache bytes (private + shared) can run at a different precision
   // than activation bytes (Q reads, score matrix) -- see model_config.h.
   int kv_precision = device->model_config.kv_cache_precision_byte;
+  // H3/CAG: when on, the shared context's attention work (FLOPs + score
+  // activation bytes) is charged once for the whole batch rather than once
+  // per sequence, so batch size does not inflate shared-attention latency
+  // (paper Sec. II-A). See model_config.h and ASSUMPTIONS.md.
+  bool amortize_shared = cag && device->model_config.cag_amortize_shared_compute;
 
   auto config = device->config;
   hw_metric compute_peak_flops = config.compute_peak_flops;
@@ -83,16 +88,19 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
     k = head_dim;
     int n_private = seq->current_len + seq->num_process_token;
     n = n_private + shared_kv_cache_len; // full context attended to (compute doesn't shrink under CAG)
+    // Under the amortized model this sequence is charged only for its
+    // private context; the shared context is added once after the loop.
+    int n_charged = amortize_shared ? n_private : n;
 
     for (int kv_idx = 0; kv_idx < num_kv_heads; kv_idx++) {
-      flops = m * k * n * 2.0 * attention_group_size;
+      flops = m * k * n_charged * 2.0 * attention_group_size;
       total_flops += flops;
 
-      // Q read + attn-score-output bytes scale with the full context (real
+      // Q read + attn-score-output bytes scale with the charged context (real
       // activation sizes, activation precision); K-cache read bytes here
       // are the private portion only (HBM, KV-cache precision) -- the
       // shared portion is charged once below (HBF).
-      memory_size = 1.0 * (m * k * num_heads / num_kv_heads + m * n * num_heads / num_kv_heads) * input->precision_byte
+      memory_size = 1.0 * (m * k * num_heads / num_kv_heads + m * n_charged * num_heads / num_kv_heads) * input->precision_byte
                    + 1.0 * k * n_private * kv_precision;
       total_memory_size += memory_size;
 
@@ -104,6 +112,26 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
       accumul_memory_duration += memory_duration;
     }
     accumul_len += n_private;
+  }
+
+  // H3/CAG (amortized model): one query-token's worth of Q*K^T against the
+  // shared context, charged once for the whole batch instead of per sequence.
+  if (amortize_shared) {
+    for (int kv_idx = 0; kv_idx < num_kv_heads; kv_idx++) {
+      flops = 1.0 * head_dim * shared_kv_cache_len * 2.0 * attention_group_size;
+      total_flops += flops;
+
+      // score-matrix activation bytes for the shared span (with flash
+      // attention these are tiled in SRAM, never per-sequence HBM traffic)
+      memory_size = 1.0 * shared_kv_cache_len * num_heads / num_kv_heads * input->precision_byte;
+      total_memory_size += memory_size;
+
+      compute_duration = flops / compute_peak_flops * 1000 * 1000 * 1000;
+      exec_status.compute_duration += compute_duration;
+      accumul_compute_duration += compute_duration;
+
+      accumul_memory_duration += memory_size / memory_bandwidth * 1000 * 1000 * 1000;
+    }
   }
 
   time_ns shared_memory_duration = 0;
@@ -146,6 +174,9 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
 
     m = seq->num_process_token;
     n = seq->current_len + seq->num_process_token + shared_kv_cache_len; // softmax over the full attended context
+    if (amortize_shared) {
+      n = seq->current_len + seq->num_process_token; // shared span charged once below
+    }
 
     flops = 7.0 * m * n * num_heads; // scale + mask + softmax
     total_flops += flops;
@@ -153,6 +184,14 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
     compute_duration = flops / compute_peak_flops * 1000 * 1000 * 1000;
 
     exec_status.total_duration += compute_duration;
+  }
+
+  // H3/CAG (amortized model): softmax over the shared span, once per batch.
+  if (amortize_shared) {
+    flops = 7.0 * shared_kv_cache_len * num_heads;
+    total_flops += flops;
+    exec_status.total_duration +=
+        flops / compute_peak_flops * 1000 * 1000 * 1000;
   }
 
   // Context //
@@ -166,15 +205,18 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
     int k_private = seq->current_len + seq->num_process_token;
     k = k_private + shared_kv_cache_len; // full context attended to
     n = head_dim;
+    // Under the amortized model this sequence is charged only for its
+    // private context; the shared context is added once after the loop.
+    int k_charged = amortize_shared ? k_private : k;
 
     for (int kv_idx = 0; kv_idx < num_kv_heads; kv_idx++) {
-      flops = m * k * n * 2.0 * attention_group_size;
+      flops = m * k_charged * n * 2.0 * attention_group_size;
       total_flops += flops;
 
-      // attn-score read bytes scale with the full context (real activation
+      // attn-score read bytes scale with the charged context (real activation
       // size, activation precision); V-cache read bytes here are the
       // private portion only (HBM, KV-cache precision).
-      memory_size = 1.0 * (m * k * num_heads / num_kv_heads + m * n * num_heads / num_kv_heads) * input->precision_byte
+      memory_size = 1.0 * (m * k_charged * num_heads / num_kv_heads + m * n * num_heads / num_kv_heads) * input->precision_byte
                    + 1.0 * k_private * n * kv_precision;
       total_memory_size += memory_size;
 
@@ -186,6 +228,24 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
       accumul_memory_duration += memory_duration;
     }
     accumul_len += k_private;
+  }
+
+  // H3/CAG (amortized model): one query-token's worth of scores*V against the
+  // shared context, charged once for the whole batch instead of per sequence.
+  if (amortize_shared) {
+    for (int kv_idx = 0; kv_idx < num_kv_heads; kv_idx++) {
+      flops = 1.0 * shared_kv_cache_len * head_dim * 2.0 * attention_group_size;
+      total_flops += flops;
+
+      memory_size = 1.0 * shared_kv_cache_len * num_heads / num_kv_heads * input->precision_byte;
+      total_memory_size += memory_size;
+
+      compute_duration = flops / compute_peak_flops * 1000 * 1000 * 1000;
+      exec_status.compute_duration += compute_duration;
+      accumul_compute_duration += compute_duration;
+
+      accumul_memory_duration += memory_size / memory_bandwidth * 1000 * 1000 * 1000;
+    }
   }
 
   shared_memory_duration = 0;

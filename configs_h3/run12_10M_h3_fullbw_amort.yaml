@@ -9,7 +9,7 @@ system:
   num_device: 8
   processor_type: GPU
   use_hbf: on # H3: add High Bandwidth Flash as a second memory tier (weights + shared KV cache)
-  hbf_bandwidth_scale: 0.5 # sensitivity knob, e.g. 0.5 for halved HBF bandwidth
+  hbf_bandwidth_scale: 1.0 # sensitivity knob, e.g. 0.5 for halved HBF bandwidth
   distribution:
     expert_tensor_degree: 32
     none_expert_tensor_degree: 32
@@ -40,6 +40,7 @@ simulation:
   context_window: 10000000 # CAG: total context length (ISL+OSL+shared pre-computed KV cache); 0 disables CAG shared cache
   precision_byte: 1
   fp8_compute_doubling: on # sensitivity knob: whether FP8/INT8 doubles GPU peak FLOPS (pre-existing, unvalidated-against-H3 convention); off to test the alternative
+  cag_amortize_shared_compute: on # H3/CAG: charge shared-context attention work once per batch, not per sequence (paper Sec. II-A); see ASSUMPTIONS.md
   kv_cache_precision_byte: 2 # paper's own 540GB/1M-token shared-cache figure only matches FP16 (2B); weights stay FP8 (precision_byte:1)
   skewness: 0.0
   iter: 10

@@ -100,6 +100,17 @@ class ModelConfig {
   // HBF when use_hbf is on. 0 disables CAG (no shared cache).
   int shared_kv_cache_len = 0;
 
+  // H3 / CAG: when true, the shared pre-computed cache's contribution to
+  // attention *work* (score/context FLOPs and the score-matrix activation
+  // bytes) is charged once per iteration for the whole batch, instead of
+  // once per sequence -- mirroring how the shared cache's own HBM/HBF read
+  // is already amortized. This implements the paper's Sec. II-A claim that
+  // shared KV attention "prevent[s] significant latency increase even with
+  // a large batch size". See ASSUMPTIONS.md: this is a modeling choice that
+  // reproduces the paper's stated behavior, NOT a physical identity --
+  // real shared-prefix attention FLOPs do scale with batch size.
+  bool cag_amortize_shared_compute = false;
+
   // KV cache (private + shared) can run at a different precision than
   // weights/activations -- e.g. the H3 paper's own numbers only work out
   // to FP8 (1B) weights + FP16 (2B) KV cache (405GB weights matches FP8;
