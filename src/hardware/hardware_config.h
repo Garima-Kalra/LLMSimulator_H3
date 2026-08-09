@@ -210,6 +210,22 @@ class SystemConfig {
   // ring across nodes -> all-gather within node), which keeps most traffic
   // on NVLink. Single-node groups are unaffected either way.
   bool allreduce_hierarchical = false;
+
+  // Achieved fraction of peak FLOPS for decode attention (eta). 1.0 = the
+  // codebase's implicit assumption that attention hits 100% of peak, which
+  // is optimistic: shared-prefix attention is a batched GEMM and private-KV
+  // attention is GEMV-shaped, and neither reaches peak in practice. Sweeping
+  // this is how the compute/memory crossover is reported as a range rather
+  // than a single number resting on a perfect-peak assumption.
+  hw_metric attn_compute_efficiency = 1.0;
+
+  // sigma: fraction of the shared CAG cache actually selected/attended per
+  // step (block-sparse selection). Scales BOTH the shared-KV bytes fetched
+  // and the shared-attention FLOPs, since selecting 5% of blocks means
+  // reading 5% of the bytes and attending to 5% of the tokens. Deliberately
+  // does NOT affect stored capacity: the full cache still occupies HBF, only
+  // the per-step traffic and work shrink. 1.0 = dense (no selection).
+  hw_metric shared_kv_sparsity = 1.0;
 };
 
 

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <ctime>
 #include <fstream>
+#include <cstdio>
 #include <iostream>
 
 #include "hardware/stat.h"
@@ -12,6 +13,28 @@
 #include "module/module_graph.h"
 
 using namespace llm_system;
+
+namespace {
+// Provenance for results.log: short commit hash, suffixed "-dirty" when the
+// working tree differs from that commit. The hash alone is not enough --
+// most rows in this project were produced from an uncommitted tree.
+std::string git_revision() {
+  std::string rev = "unknown";
+  char buf[128];
+  if (FILE *f = popen("git rev-parse --short HEAD 2>/dev/null", "r")) {
+    if (fgets(buf, sizeof buf, f)) {
+      rev = buf;
+      rev.erase(rev.find_last_not_of(" \n\r\t") + 1);
+    }
+    pclose(f);
+  }
+  if (FILE *f = popen("git status --porcelain 2>/dev/null", "r")) {
+    if (fgets(buf, sizeof buf, f)) rev += "-dirty";
+    pclose(f);
+  }
+  return rev;
+}
+}  // namespace
 
 int main(int argc, char *argv[]) {
   YAML::Node config;
@@ -76,6 +99,13 @@ int main(int argc, char *argv[]) {
   // fabric (paper's stated "ring all-reduce"); true = hierarchical/NCCL-style.
   system_config.allreduce_hierarchical =
       config["system"]["allreduce_hierarchical"].as<bool>(false);
+  // eta: achieved fraction of peak FLOPS for decode attention. Swept to
+  // report the compute/memory crossover as a range. 1.0 = perfect peak.
+  system_config.attn_compute_efficiency =
+      config["system"]["attn_compute_efficiency"].as<double>(1.0);
+  // sigma: shared-KV selection fraction (scales shared bytes AND shared FLOPs).
+  system_config.shared_kv_sparsity =
+      config["system"]["shared_kv_sparsity"].as<double>(1.0);
 
   // NVLink Config // 
   if(config["system"]["nvlink_gen"].as<int>() == 4){
@@ -458,20 +488,39 @@ int main(int argc, char *argv[]) {
   double throughput_per_power =
       total_power_watts > 0 ? throughput_tps / total_power_watts : 0.0;
 
+  // Term-by-term attention breakdown (closed-form reconciliation aid).
+  {
+    auto &st = cluster->get_device(0)->status;
+    double np = st.attn_dbg_calls > 0 ? st.attn_dbg_n_private / st.attn_dbg_calls : 0.0;
+    std::cout << "\n[ATTN BREAKDOWN] (ms, device 0, summed over all iterations)\n"
+              << "  mean n_private (private ctx tokens actually used) = " << np << "\n"
+              << "  T_comp  score=" << st.attn_c_score/1e6
+              << "  softmax=" << st.attn_c_softmax/1e6
+              << "  ctx=" << st.attn_c_ctx/1e6
+              << "  TOTAL=" << st.attn_compute_time/1e6 << "\n"
+              << "  T_mem   score_priv=" << st.attn_m_score_priv/1e6
+              << "  score_shared=" << st.attn_m_score_shared/1e6
+              << "  ctx_priv=" << st.attn_m_ctx_priv/1e6
+              << "  ctx_shared=" << st.attn_m_ctx_shared/1e6
+              << "  TOTAL=" << st.attn_memory_time/1e6 << "\n\n";
+  }
+
   std::string results_log_path = "../results.log";
   bool write_header = !std::ifstream(results_log_path).good();
   std::ofstream results_log(results_log_path, std::ios::app);
   if (write_header) {
-    results_log << "timestamp,model,gpu_gen,use_hbf,hbf_bandwidth_scale,"
+    results_log << "timestamp,git_rev,model,gpu_gen,use_hbf,hbf_bandwidth_scale,"
                    "num_node,num_device,ne_tp_dg,context_parallel_degree,"
                    "fp8_compute_doubling,cag_amortize_shared_compute,"
                    "hbm_reserve_fraction,allreduce_hierarchical,"
+                   "attn_compute_efficiency,shared_kv_sparsity,attn_compute_ms,attn_memory_ms,"
                    "context_window,input_len,"
                    "output_len,requested_max_batch_size,final_max_batch_size,"
                    "throughput_tps,per_device_power_w,total_power_w,"
                    "throughput_per_power\n";
   }
   results_log << std::time(nullptr) << ","
+              << git_revision() << ","
               << model_name << ","
               << gpu_gen << ","
               << use_hbf << ","
@@ -484,6 +533,10 @@ int main(int argc, char *argv[]) {
               << model_config.cag_amortize_shared_compute << ","
               << system_config.hbm_reserve_fraction << ","
               << system_config.allreduce_hierarchical << ","
+              << system_config.attn_compute_efficiency << ","
+              << system_config.shared_kv_sparsity << ","
+              << cluster->get_device(0)->status.attn_compute_time / 1.0e6 << ","
+              << cluster->get_device(0)->status.attn_memory_time / 1.0e6 << ","
               << context_window << ","
               << input_len << ","
               << output_len << ","

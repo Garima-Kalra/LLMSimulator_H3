@@ -69,6 +69,21 @@ class StatusBoard {
   time_ns high_time = 0;  // time of GPU
   time_ns low_time = 0;   // time of PIM
 
+  // Roofline instrumentation for the decode-attention crossover study:
+  // accumulated attention compute vs. attention memory time, kept separate
+  // so the compute/memory crossing can be located empirically instead of
+  // inferred from a ratio. See ASSUMPTIONS.md.
+  time_ns attn_compute_time = 0;
+  time_ns attn_memory_time = 0;
+
+  // Term-by-term breakdown for closed-form reconciliation. Sums to the two
+  // totals above; dumped by eval/test.cpp so every component of T_comp and
+  // T_mem can be checked against an independent hand derivation.
+  time_ns attn_c_score = 0, attn_c_softmax = 0, attn_c_ctx = 0;
+  time_ns attn_m_score_priv = 0, attn_m_score_shared = 0;
+  time_ns attn_m_ctx_priv = 0, attn_m_ctx_shared = 0;
+  double  attn_dbg_n_private = 0, attn_dbg_calls = 0;
+
   Tensor_Ptr tensor;
 
   TensorVec tensor_vec;

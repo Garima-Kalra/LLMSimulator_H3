@@ -15648,3 +15648,18 @@ index 94590a4..0000000
 -  AddrMapper:
 -    impl: RoBaRaCoCh
 \ No newline at end of file
+diff --git a/src/base/utils.h b/src/base/utils.h
+index fc4edbc..6bd68ae 100644
+--- a/src/base/utils.h
++++ b/src/base/utils.h
+@@ -1,9 +1,9 @@
+ #ifndef RAMULATOR_BASE_UTILS_H
+ #define RAMULATOR_BASE_UTILS_H
+ 
++#include <cstdint>
+ #include <string>
+ #include <vector>
+-#include <cstdint>
+ 
+ namespace Ramulator {
+ 

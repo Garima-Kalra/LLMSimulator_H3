@@ -148,16 +148,28 @@ SelfAttentionParallel::SelfAttentionParallel(std::string& prefix,
   // attention.cpp/attention_gen_impl.cpp). This is a pure roofline cost
   // model with no per-device head-identity branching (every device in the
   // TP group is modeled as owning an equal share, num_kv_heads/head_tp_dg,
-  // regardless of rank), so num_heads/parallel_num is unaffected: the
-  // summed FLOPs total is invariant to how parallel_num factors into
-  // head_tp_dg x context_parallel_degree, since
-  // attention_group_size * num_kv_heads_local == num_heads_local always.
+  // regardless of rank).
   int cp_dg = device->model_config.context_parallel_degree;
   assertTrue(parallel_num % cp_dg == 0,
              "ne_tp_dg must be divisible by context_parallel_degree");
   int head_tp_dg = parallel_num / cp_dg;
 
-  assertTrue(num_heads % parallel_num == 0, "num_head mod parallel_num == 0");
+  // Context parallelism REPLICATES query heads across the cp group and splits
+  // tokens instead. Sharding query heads by the full parallel_num while also
+  // slicing the context by cp_dg double-shards the same dimension and
+  // under-counts attention work by exactly cp_dg. Query heads therefore shard
+  // by head_tp_dg for the attention COMPUTE (AttentionSum/AttentionGen).
+  // AttentionSplit/AttentionMerge keep parallel_num: they interface the
+  // ne_tp_dg-sharded QKV/O projections. The implied dataflow is Q all-gather
+  // across the cp group (Q is ~1 token, sub-MB), attention over all
+  // num_heads/head_tp_dg heads on this device's Ls/cp_dg slice, cp-combine,
+  // then each device keeps its num_heads/parallel_num share for the O proj.
+  // NOTE: the Q/O projection *weights* are still sharded by ne_tp_dg
+  // elsewhere; strictly consistent CP would replicate them across the cp
+  // group. That affects capacity, not the attention FLOPs corrected here --
+  // see ASSUMPTIONS.md.
+  assertTrue(num_heads % head_tp_dg == 0,
+             "num_head mod (ne_tp_dg/context_parallel_degree) == 0");
   assertTrue(num_kv_heads % head_tp_dg == 0,
              "num_kv_head mod (ne_tp_dg/context_parallel_degree) == 0");
 
@@ -168,13 +180,13 @@ SelfAttentionParallel::SelfAttentionParallel(std::string& prefix,
   add_module(attention_split);
 
   Module::Ptr attention_sum = SelfAttentionSum::Create(
-  module_map_name, "AttentionSum", head_dim, num_heads / parallel_num,
+  module_map_name, "AttentionSum", head_dim, num_heads / head_tp_dg,
   num_kv_heads / head_tp_dg, max_seq_len, batch_size, qk_rope_head_dim, device_list,
   device);
   add_module(attention_sum);
 
   Module::Ptr attention_gen = SelfAttentionGen::Create(
-  module_map_name, "AttentionGen", head_dim, num_heads / parallel_num,
+  module_map_name, "AttentionGen", head_dim, num_heads / head_tp_dg,
   num_kv_heads / head_tp_dg, max_seq_len, batch_size, qk_rope_head_dim, device_list,
   device);
   add_module(attention_gen);

@@ -32,9 +32,12 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
   // the shared cache (see attention.cpp's SelfAttentionGen constructor,
   // which sizes k/v_cache_shared identically) -- the cross-device combine
   // of these partial results happens afterward in SelfAttentionParallel.
+  // sigma scales the attended/fetched span. Applied here (the cost path)
+  // only -- stored capacity is unaffected, which is the point of selection.
   int shared_kv_cache_len =
-      cag ? device->model_config.shared_kv_cache_len /
-                device->model_config.context_parallel_degree
+      cag ? (int)(1.0 * device->model_config.shared_kv_cache_len /
+                  device->model_config.context_parallel_degree *
+                  device->config.shared_kv_sparsity)
           : 0;
   // KV cache bytes (private + shared) can run at a different precision
   // than activation bytes (Q reads, score matrix) -- see model_config.h.
@@ -46,7 +49,9 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
   bool amortize_shared = cag && device->model_config.cag_amortize_shared_compute;
 
   auto config = device->config;
-  hw_metric compute_peak_flops = config.compute_peak_flops;
+  // eta: achieved fraction of peak for attention (default 1.0 = unchanged).
+  hw_metric compute_peak_flops =
+      config.compute_peak_flops * config.attn_compute_efficiency;
   hw_metric memory_bandwidth = config.memory_bandwidth;
 
   int head_dim = layer_info.head_dim;
@@ -91,6 +96,8 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
     // Under the amortized model this sequence is charged only for its
     // private context; the shared context is added once after the loop.
     int n_charged = amortize_shared ? n_private : n;
+    device->status.attn_dbg_n_private += n_private;
+    device->status.attn_dbg_calls += 1;
 
     for (int kv_idx = 0; kv_idx < num_kv_heads; kv_idx++) {
       flops = m * k * n_charged * 2.0 * attention_group_size;
@@ -100,8 +107,16 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
       // activation sizes, activation precision); K-cache read bytes here
       // are the private portion only (HBM, KV-cache precision) -- the
       // shared portion is charged once below (HBF).
-      memory_size = 1.0 * (m * k * num_heads / num_kv_heads + m * n_charged * num_heads / num_kv_heads) * input->precision_byte
+      // Q read + private K read. The score matrix (m x n_charged) is NOT
+      // charged to HBM under flash attention: it is produced and consumed
+      // tile-by-tile in SRAM and never round-trips. Charging it per sequence
+      // over the full context added ~B x context bytes/iteration, which
+      // swamped every real term at large batch.
+      memory_size = 1.0 * m * k * num_heads / num_kv_heads * input->precision_byte
                    + 1.0 * k * n_private * kv_precision;
+      if (!config.use_flash_attention) {
+        memory_size += 1.0 * m * n_charged * num_heads / num_kv_heads * input->precision_byte;
+      }
       total_memory_size += memory_size;
 
       compute_duration = flops / compute_peak_flops * 1000 * 1000 * 1000;
@@ -110,6 +125,8 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
 
       memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
       accumul_memory_duration += memory_duration;
+      device->status.attn_m_score_priv += memory_duration;
+      device->status.attn_c_score += compute_duration;
     }
     accumul_len += n_private;
   }
@@ -162,6 +179,9 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
     exec_status += temp;
   }
 
+  device->status.attn_compute_time += accumul_compute_duration;
+  device->status.attn_memory_time += accumul_memory_duration + shared_memory_duration;
+  device->status.attn_m_score_shared += shared_memory_duration;
   exec_status.total_duration +=
       std::max(accumul_compute_duration, accumul_memory_duration + shared_memory_duration);
 
@@ -183,6 +203,8 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
 
     compute_duration = flops / compute_peak_flops * 1000 * 1000 * 1000;
 
+    device->status.attn_compute_time += compute_duration;
+    device->status.attn_c_softmax += compute_duration;
     exec_status.total_duration += compute_duration;
   }
 
@@ -216,8 +238,13 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
       // attn-score read bytes scale with the charged context (real activation
       // size, activation precision); V-cache read bytes here are the
       // private portion only (HBM, KV-cache precision).
-      memory_size = 1.0 * (m * k_charged * num_heads / num_kv_heads + m * n * num_heads / num_kv_heads) * input->precision_byte
+      // context output write + private V read; the score-matrix read
+      // (m x k_charged) stays in SRAM under flash attention -- see scoring.
+      memory_size = 1.0 * m * n * num_heads / num_kv_heads * input->precision_byte
                    + 1.0 * k_private * n * kv_precision;
+      if (!config.use_flash_attention) {
+        memory_size += 1.0 * m * k_charged * num_heads / num_kv_heads * input->precision_byte;
+      }
       total_memory_size += memory_size;
 
       compute_duration = flops / compute_peak_flops * 1000 * 1000 * 1000;
@@ -226,6 +253,8 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
 
       memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
       accumul_memory_duration += memory_duration;
+      device->status.attn_m_ctx_priv += memory_duration;
+      device->status.attn_c_ctx += compute_duration;
     }
     accumul_len += k_private;
   }
@@ -276,6 +305,9 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
     exec_status += temp;
   }
 
+  device->status.attn_compute_time += accumul_compute_duration;
+  device->status.attn_memory_time += accumul_memory_duration + shared_memory_duration;
+  device->status.attn_m_ctx_shared += shared_memory_duration;
   exec_status.total_duration +=
       std::max(accumul_compute_duration, accumul_memory_duration + shared_memory_duration);
 
