@@ -1,3 +1,7 @@
 build/
 __pycache__/
 .venv/
+ext/
+build/
+log/
+*.log
