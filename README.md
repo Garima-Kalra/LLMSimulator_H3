@@ -54,3 +54,9 @@ Juhwan Cho juhwan.cho@scale.snu.ac.kr
 ## Note
 This simulator builds upon the simulator introduced in the MICRO 2024 paper “Duplex: A Device for Large Language Models with Mixture of Experts, Grouped Query Attention, and Continuous Batching.”# LLMsim
 # LLMsim
+
+## Build notes (H3 fork)
+1. `git submodule update --init --recursive`
+2. `cd src/dram/ramulator2 && git apply ../../../patch/ramulator2_pim.patch && cd ../../../`
+3. On GCC 13+, also apply `ramulator2_local_fixes.patch` (adds missing `#include <cstdint>`)
+4. `mkdir build && cd build && cmake .. && make -j`
