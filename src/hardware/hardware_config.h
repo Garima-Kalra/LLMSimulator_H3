@@ -226,6 +226,22 @@ class SystemConfig {
   // does NOT affect stored capacity: the full cache still occupies HBF, only
   // the per-step traffic and work shrink. 1.0 = dense (no selection).
   hw_metric shared_kv_sparsity = 1.0;
+  
+  // Physical integration topology of the HBM/HBF tiers.
+  //   "independent"  each stack has its own GPU-side link; HBM and HBF
+  //                  transfers overlap (this is what max() below assumes)
+  //   "cascaded"     H3's daisy chain: HBF hangs off the HBM base die, so
+  //                  all traffic crosses one shared link and serializes
+  //   "shared_base"  mixed dies over one base die, one link per stack
+  std::string link_topology = "independent";
+
+  // Stack sites available on the GPU shoreline. Cascaded HBF consumes none;
+  // side-by-side HBF displaces an HBM stack.
+  int shoreline_slots = 8;
+
+  // Bandwidth of the shared GPU-side link, for topologies where the two
+  // tiers do not have independent paths. 0 = unused (independent links).
+  hw_metric shared_link_bandwidth = 0.0;
 };
 
 

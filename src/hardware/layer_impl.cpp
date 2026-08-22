@@ -16,6 +16,20 @@ time_ns h3MemoryDuration(SystemConfig config, hw_metric hbm_bytes, hw_metric hbf
   }
   hw_metric hbf_bandwidth = config.hbf_bandwidth * config.hbf_bandwidth_scale;
   time_ns hbf_duration = hbf_bytes / hbf_bandwidth * 1000 * 1000 * 1000;
+
+  // Topologies without independent paths: both tiers cross one link, so the
+  // transfers serialize. HBF media bandwidth remains a second, separate cap.
+  if ((config.link_topology == "cascaded" ||
+       config.link_topology == "shared_base") &&
+      config.shared_link_bandwidth > 0) {
+    time_ns link_duration = (hbm_bytes + hbf_bytes) /
+                            config.shared_link_bandwidth * 1000 * 1000 * 1000;
+    return std::max(link_duration, hbf_duration);
+  }
+  return std::max(hbm_duration, hbf_duration);
+
+  // "independent" (side-by-side / co-located) and "shared_base": each stack
+  // has its own path to the GPU, so the transfers overlap.
   return std::max(hbm_duration, hbf_duration);
 }
 

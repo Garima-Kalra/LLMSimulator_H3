@@ -1,0 +1,30 @@
+>>> hbm_only   (hbf_bandwidth_scale=1.0)
+    exit=0  wall=193s
+    row: timestamp,git_rev,model,gpu_gen,use_hbf,hbf_bandwidth_scale,num_node,num_device,ne_tp_dg,context_parallel_degree,fp8_compute_doubling,cag_amortize_shared_compute,hbm_reserve_fraction,allreduce_hierarchical,attn_compute_efficiency,shared_kv_sparsity,attn_compute_ms,attn_memory_ms,context_window,input_len,output_len,requested_max_batch_size,final_max_batch_size,throughput_tps,per_device_power_w,total_power_w,throughput_per_power
+    row: 1786915583,cc0e744-dirty,llama3_405B,B200,0,1,4,8,32,4,1,0,0,0,1,1,121.513,21.8885,10000000,1000,1000,8000,209,1453.27,1000,32000,0.0454147
+
+>>> h3_bw100   (hbf_bandwidth_scale=1.0)
+    exit=0  wall=195s
+    row: 1786915778,cc0e744-dirty,llama3_405B,B200,1,1,4,8,32,4,1,0,0,0,1,1,923.265,33.3202,10000000,1000,1000,8000,1588,1487.29,2280,72960,0.020385
+
+>>> h3_bw75   (hbf_bandwidth_scale=0.75)
+    exit=0  wall=194s
+    row: 1786915973,cc0e744-dirty,llama3_405B,B200,1,0.75,4,8,32,4,1,0,0,0,1,1,923.265,40.0388,10000000,1000,1000,8000,1588,1487.29,2280,72960,0.020385
+
+>>> h3_bw50   (hbf_bandwidth_scale=0.5)
+    exit=0  wall=195s
+    row: 1786916167,cc0e744-dirty,llama3_405B,B200,1,0.5,4,8,32,4,1,0,0,0,1,1,923.265,53.4761,10000000,1000,1000,8000,1588,1487.29,2280,72960,0.020385
+
+>>> h3_bw25   (hbf_bandwidth_scale=0.25)
+    exit=0  wall=196s
+    row: 1786916363,cc0e744-dirty,llama3_405B,B200,1,0.25,4,8,32,4,1,0,0,0,1,1,923.265,93.7881,10000000,1000,1000,8000,1588,1487.29,2280,72960,0.020385
+
+>>> h3_bw10   (hbf_bandwidth_scale=0.10)
+    exit=0  wall=197s
+    row: 1786916561,cc0e744-dirty,llama3_405B,B200,1,0.1,4,8,32,4,1,0,0,0,1,1,923.265,214.724,10000000,1000,1000,8000,1588,1477.44,2280,72960,0.02025
+
+>>> h3_bw05   (hbf_bandwidth_scale=0.05)
+    exit=0  wall=196s
+    row: 1786916757,cc0e744-dirty,llama3_405B,B200,1,0.05,4,8,32,4,1,0,0,0,1,1,923.265,416.284,10000000,1000,1000,8000,1588,1455.3,2280,72960,0.0199466
+
+Done. results.log now has 8 lines.

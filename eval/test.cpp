@@ -5,7 +5,7 @@
 #include <fstream>
 #include <cstdio>
 #include <iostream>
-
+#include <iomanip>
 #include "hardware/stat.h"
 #include "model/model.h"
 #include "model/util.h"
@@ -106,6 +106,84 @@ int main(int argc, char *argv[]) {
   // sigma: shared-KV selection fraction (scales shared bytes AND shared FLOPs).
   system_config.shared_kv_sparsity =
       config["system"]["shared_kv_sparsity"].as<double>(1.0);
+  
+  // === ARCHITECTURE ========================================================
+  //   cascaded    : each site = HBM stack + HBF stack chained behind it.
+  //                 Both tiers cross the site's link -> pooled/contended.
+  //   side_by_side: sites are single-tier. HBF sites displace HBM sites.
+  //                 Independent links -> bandwidth partitioned per tier.
+  //   shared_base : each site = one stack, dies split HBM/HBF over one base
+  //                 die. HBF dies displace HBM dies. Link pooled.
+  //   hbf_only    : side_by_side with minimal HBM.
+  std::string arch =
+      config["system"]["architecture"].as<std::string>("legacy");
+  system_config.shoreline_slots =
+      config["system"]["shoreline_slots"].as<int>(8);
+  int dies = config["system"]["dies_per_stack"].as<int>(8);
+
+  if (arch != "legacy") {
+    hw_metric hbm_die = system_config.memory_capacity / system_config.num_cube / dies;
+    hw_metric hbf_die = system_config.hbf_capacity / system_config.num_hbf_cube / dies;
+    hw_metric site_bw = system_config.memory_bandwidth / system_config.num_cube;
+    hw_metric die_bw = site_bw / dies;
+
+    int hbm_sites = config["system"]["hbm_sites"].as<int>(0);
+    int hbf_sites = config["system"]["hbf_sites"].as<int>(0);
+    int hbm_dies_ps = config["system"]["hbm_dies_per_site"].as<int>(dies);
+    int hbf_dies_ps = config["system"]["hbf_dies_per_site"].as<int>(dies);
+
+    long hbm_dies_tot = 0, hbf_dies_tot = 0;
+    int slots = 0;
+    hw_metric hbm_bw = 0, hbf_bw = 0, shared_bw = 0;
+
+    if (arch == "cascaded" || arch == "shared_base") {
+      if (arch == "shared_base") {
+        assertTrue(hbm_dies_ps + hbf_dies_ps <= dies,
+                   "shared_base: HBM+HBF dies exceed dies_per_stack");
+      }
+      slots = hbm_sites;                 // chained/mixed HBF costs no extra site
+      hbm_dies_tot = (long)hbm_sites * hbm_dies_ps;
+      hbf_dies_tot = (long)hbm_sites * hbf_dies_ps;
+      shared_bw = hbm_sites * site_bw;   // one pooled link budget
+      hbm_bw = shared_bw;
+      hbf_bw = std::min((hw_metric)hbf_dies_tot * die_bw, shared_bw);
+    } else {                             // side_by_side, hbf_only
+      slots = hbm_sites + hbf_sites;
+      hbm_dies_tot = (long)hbm_sites * hbm_dies_ps;
+      hbf_dies_tot = (long)hbf_sites * hbf_dies_ps;
+      hbm_bw = hbm_sites * site_bw;      // partitioned, independent paths
+      hbf_bw = hbf_sites * site_bw;
+      shared_bw = 0.0;
+    }
+
+    system_config.memory_capacity = hbm_die * hbm_dies_tot;
+    system_config.memory_bandwidth = hbm_bw;
+    system_config.hbf_capacity = hbf_die * hbf_dies_tot;
+    system_config.hbf_bandwidth = hbf_bw;
+    system_config.shared_link_bandwidth = shared_bw;
+    system_config.use_hbf = (hbf_dies_tot > 0);
+    system_config.num_cube = (int)(hbm_dies_tot / dies);
+    system_config.num_hbf_cube = (int)(hbf_dies_tot / dies);
+
+    assertTrue(slots <= system_config.shoreline_slots,
+               "architecture exceeds shoreline budget");
+    assertTrue(system_config.memory_capacity > 0,
+               "no HBM: activations and generated KV need a read/write tier");
+
+    printf("\n+================================================================+\n");
+    printf("| ARCHITECTURE: %-28s sites %d / %-9d |\n",
+           arch.c_str(), slots, system_config.shoreline_slots);
+    printf("+================================================================+\n");
+    printf("|  HBM %9.0f GB  @ %5.2f TB/s   %3ld dies                    |\n",
+           system_config.memory_capacity / 1073741824.0, hbm_bw / 1e12, hbm_dies_tot);
+    printf("|  HBF %9.0f GB  @ %5.2f TB/s   %3ld dies                    |\n",
+           system_config.hbf_capacity / 1073741824.0, hbf_bw / 1e12, hbf_dies_tot);
+    printf("|  LINK %-11s %-45s|\n",
+           shared_bw > 0 ? "POOLED" : "PARTITIONED",
+           shared_bw > 0 ? "both tiers share one link" : "tiers have separate paths");
+    printf("+================================================================+\n\n");
+    use_hbf = system_config.use_hbf;   // local drives the memory-check path below
+  }
 
   // NVLink Config // 
   if(config["system"]["nvlink_gen"].as<int>() == 4){
@@ -509,15 +587,16 @@ int main(int argc, char *argv[]) {
   bool write_header = !std::ifstream(results_log_path).good();
   std::ofstream results_log(results_log_path, std::ios::app);
   if (write_header) {
-    results_log << "timestamp,git_rev,model,gpu_gen,use_hbf,hbf_bandwidth_scale,"
-                   "num_node,num_device,ne_tp_dg,context_parallel_degree,"
-                   "fp8_compute_doubling,cag_amortize_shared_compute,"
-                   "hbm_reserve_fraction,allreduce_hierarchical,"
-                   "attn_compute_efficiency,shared_kv_sparsity,attn_compute_ms,attn_memory_ms,"
-                   "context_window,input_len,"
-                   "output_len,requested_max_batch_size,final_max_batch_size,"
-                   "throughput_tps,per_device_power_w,total_power_w,"
-                   "throughput_per_power\n";
+      results_log << "timestamp,git_rev,model,gpu_gen,use_hbf,hbf_bandwidth_scale,"
+                    "architecture,hbm_gb,hbf_gb,hbm_bw_tbs,hbf_bw_tbs,shared_link,"
+                    "num_node,num_device,ne_tp_dg,context_parallel_degree,"
+                    "fp8_compute_doubling,cag_amortize_shared_compute,"
+                    "hbm_reserve_fraction,allreduce_hierarchical,"
+                    "attn_compute_efficiency,shared_kv_sparsity,attn_compute_ms,attn_memory_ms,"
+                    "context_window,input_len,"
+                    "output_len,requested_max_batch_size,final_max_batch_size,"
+                    "throughput_tps,per_device_power_w,total_power_w,"
+                    "throughput_per_power\n";
   }
   results_log << std::time(nullptr) << ","
               << git_revision() << ","
@@ -525,6 +604,12 @@ int main(int argc, char *argv[]) {
               << gpu_gen << ","
               << use_hbf << ","
               << system_config.hbf_bandwidth_scale << ","
+              << arch << ","
+              << system_config.memory_capacity / 1073741824.0 << ","
+              << system_config.hbf_capacity / 1073741824.0 << ","
+              << system_config.memory_bandwidth / 1e12 << ","
+              << system_config.hbf_bandwidth / 1e12 << ","
+              << (system_config.shared_link_bandwidth > 0 ? 1 : 0) << ","
               << num_node << ","
               << num_device << ","
               << model_config.ne_tp_dg << ","
