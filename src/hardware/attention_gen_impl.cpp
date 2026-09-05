@@ -138,9 +138,13 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
       flops = 1.0 * head_dim * shared_kv_cache_len * 2.0 * attention_group_size;
       total_flops += flops;
 
-      // score-matrix activation bytes for the shared span (with flash
-      // attention these are tiled in SRAM, never per-sequence HBM traffic)
-      memory_size = 1.0 * shared_kv_cache_len * num_heads / num_kv_heads * input->precision_byte;
+      // score-matrix activation bytes for the shared span. With flash
+      // attention these are tiled in on-chip SRAM and never reach HBM, so
+      // they are not charged -- matching the guard on the per-sequence path.
+      memory_size = 0.0;
+      if (!config.use_flash_attention) {
+        memory_size = 1.0 * shared_kv_cache_len * num_heads / num_kv_heads * input->precision_byte;
+      }
       total_memory_size += memory_size;
 
       compute_duration = flops / compute_peak_flops * 1000 * 1000 * 1000;
@@ -155,8 +159,14 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
   if (cag) {
     hw_metric shared_memory_size = 1.0 * num_kv_heads * head_dim * shared_kv_cache_len * kv_precision;
     total_memory_size += shared_memory_size;
+    // Cost functions must not permanently resize model state: when
+    // shared_kv_sparsity < 1, shared_kv_cache_len is the READ length, not the
+    // STORED length, and overwriting the shape here would shrink what
+    // checkH3MemorySize() sees. Snapshot, borrow, restore.
+    auto k_shared_orig_shape = k_cache_shared->shape;
     k_cache_shared->setShape({shared_kv_cache_len, head_dim * num_kv_heads});
     ExecStatus temp = getIdealMemoryStatus(device, ProcessorType::GPU, DRAMRequestType::kRead, k_cache_shared);
+    k_cache_shared->setShape(k_shared_orig_shape);
     exec_status += temp;
     hw_metric shared_hbm_bytes = k_cache_shared->in_hbf ? 0 : shared_memory_size;
     hw_metric shared_hbf_bytes = k_cache_shared->in_hbf ? shared_memory_size : 0;
@@ -266,7 +276,12 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
       flops = 1.0 * shared_kv_cache_len * head_dim * 2.0 * attention_group_size;
       total_flops += flops;
 
-      memory_size = 1.0 * shared_kv_cache_len * num_heads / num_kv_heads * input->precision_byte;
+      // Softmax-output activation bytes for the shared span. Same reasoning
+      // as the scoring block above: flash attention keeps these in SRAM.
+      memory_size = 0.0;
+      if (!config.use_flash_attention) {
+        memory_size = 1.0 * shared_kv_cache_len * num_heads / num_kv_heads * input->precision_byte;
+      }
       total_memory_size += memory_size;
 
       compute_duration = flops / compute_peak_flops * 1000 * 1000 * 1000;
@@ -281,8 +296,14 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
   if (cag) {
     hw_metric shared_memory_size = 1.0 * num_kv_heads * shared_kv_cache_len * head_dim * kv_precision;
     total_memory_size += shared_memory_size;
+    // Cost functions must not permanently resize model state: when
+    // shared_kv_sparsity < 1, shared_kv_cache_len is the READ length, not the
+    // STORED length, and overwriting the shape here would shrink what
+    // checkH3MemorySize() sees. Snapshot, borrow, restore.
+    auto v_shared_orig_shape = v_cache_shared->shape;
     v_cache_shared->setShape({shared_kv_cache_len, head_dim * num_kv_heads});
     ExecStatus temp = getIdealMemoryStatus(device, ProcessorType::GPU, DRAMRequestType::kRead, v_cache_shared);
+    v_cache_shared->setShape(v_shared_orig_shape);
     exec_status += temp;
     hw_metric shared_hbm_bytes = v_cache_shared->in_hbf ? 0 : shared_memory_size;
     hw_metric shared_hbf_bytes = v_cache_shared->in_hbf ? shared_memory_size : 0;

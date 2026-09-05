@@ -199,17 +199,31 @@ SelfAttentionParallel::SelfAttentionParallel(std::string& prefix,
 
   // H3: when the shared cache is split cp_dg ways, each device only holds a
   // partial (online-softmax) attention result over its slice and needs to
-  // combine with its cp_dg peers. Reuses AllReduce's ring-combine cost model
-  // verbatim. Any cp_dg-sized subset of device_list gives an identical cost
-  // -- AllReduce::forward's cost depends only on group size and the
-  // (uniform, non-topology-aware) device_ict_latency/bandwidth, not on
-  // which specific devices are in the group -- so the first cp_dg devices
-  // are used unconditionally rather than computing this device's "true"
-  // peers.
+  // combine with its cp_dg peers. Reuses AllReduce's ring-combine cost model.
+  //
+  // Peer layout: cp groups are CONTIGUOUS in device_list -- positions
+  // [g*cp_dg, (g+1)*cp_dg) own one KV-head share and split the context
+  // between them. This is deliberate: the merge runs once per layer, so cp
+  // peers should sit as close together as possible (ideally inside one node).
+  //
+  // NOTE: AllReduce::forward is now topology-aware -- it derives each rank's
+  // node as rank / num_device and charges the scale-out fabric when the group
+  // spans nodes. The identity of the peers therefore AFFECTS COST, so the
+  // group must be derived from this device's own rank. (It previously took
+  // the first cp_dg entries unconditionally, which was safe only while the
+  // all-reduce cost depended on group size alone.)
   has_context_merge = cp_dg > 1;
   if (has_context_merge) {
-    std::vector<int> cp_device_list(device_list.begin(),
-                                    device_list.begin() + cp_dg);
+    int my_pos = 0;
+    for (int i = 0; i < (int)device_list.size(); i++) {
+      if (device_list.at(i) == device->device_total_rank) {
+        my_pos = i;
+        break;
+      }
+    }
+    int group_start = (my_pos / cp_dg) * cp_dg;
+    std::vector<int> cp_device_list(device_list.begin() + group_start,
+                                    device_list.begin() + group_start + cp_dg);
     auto context_merge = AllReduce::Create(module_map_name, "context_merge",
                                            cp_device_list, device);
     add_module(context_merge);
