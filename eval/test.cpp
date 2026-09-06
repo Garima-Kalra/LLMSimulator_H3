@@ -1,4 +1,5 @@
 #include <yaml-cpp/yaml.h>
+#include "validate_config.h"
 
 #include <algorithm>
 #include <ctime>
@@ -45,6 +46,14 @@ int main(int argc, char *argv[]) {
   else{
     config = YAML::LoadFile("config.yaml");
   }
+
+  // Reject unrecognised keys and warn on silent defaults. Three separate
+  // results in this project were invalidated by configs that parsed cleanly
+  // but did not mean what they appeared to: hbm_reserve_fraction missing from
+  // 45 of 55 files, link_topology never read at all, and a hand-written
+  // hbf_stacks key that no code consumes -- which made three "different"
+  // flash configurations produce byte-identical output.
+  validateConfig(config);
 
   std::string model_name = config["model"]["model_name"].as<std::string>();
   std::string processor_type =
@@ -106,6 +115,14 @@ int main(int argc, char *argv[]) {
   // sigma: shared-KV selection fraction (scales shared bytes AND shared FLOPs).
   system_config.shared_kv_sparsity =
       config["system"]["shared_kv_sparsity"].as<double>(1.0);
+  // Memory-link timing model, consumed by h3MemoryDuration():
+  //   independent  -> tiers overlap,  max(hbm, hbf)
+  //   cascaded /
+  //   shared_base  -> tiers contend over one link, (hbm+hbf)/shared_bw
+  // For arch != "legacy" this is derived from the architecture further down;
+  // this read covers legacy runs and allows an explicit override.
+  system_config.link_topology =
+      config["system"]["link_topology"].as<std::string>("independent");
   
   // === ARCHITECTURE ========================================================
   //   cascaded    : each site = HBM stack + HBF stack chained behind it.
@@ -161,6 +178,15 @@ int main(int argc, char *argv[]) {
     system_config.hbf_capacity = hbf_die * hbf_dies_tot;
     system_config.hbf_bandwidth = hbf_bw;
     system_config.shared_link_bandwidth = shared_bw;
+    // Derive the timing model from the architecture. Without this the
+    // "LINK POOLED" banner below prints while h3MemoryDuration still takes
+    // max(), which hands pooled designs ~50% more effective aggregate
+    // bandwidth than their partitioned counterparts and makes the
+    // pooled-vs-partitioned comparison unmatched. Explicit override wins.
+    system_config.link_topology =
+        config["system"]["link_topology"].as<std::string>(
+            shared_bw > 0 ? (arch == "shared_base" ? "shared_base" : "cascaded")
+                          : "independent");
     system_config.use_hbf = (hbf_dies_tot > 0);
     system_config.num_cube = (int)(hbm_dies_tot / dies);
     system_config.num_hbf_cube = (int)(hbf_dies_tot / dies);
@@ -582,6 +608,7 @@ int main(int argc, char *argv[]) {
               << "  ctx_shared=" << st.attn_m_ctx_shared/1e6
               << "  TOTAL=" << st.attn_memory_time/1e6 << "\n\n";
   }
+
   // H3 Action Item 2: HBM->HBF private-KV spill traffic, aggregated across
   // devices. Simulated wall clock is total_latency below, so this block must
   // stay after the stat_list loop -- move it if you reorder.

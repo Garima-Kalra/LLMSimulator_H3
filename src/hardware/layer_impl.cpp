@@ -26,10 +26,8 @@ time_ns h3MemoryDuration(SystemConfig config, hw_metric hbm_bytes, hw_metric hbf
                             config.shared_link_bandwidth * 1000 * 1000 * 1000;
     return std::max(link_duration, hbf_duration);
   }
-  return std::max(hbm_duration, hbf_duration);
-
-  // "independent" (side-by-side / co-located) and "shared_base": each stack
-  // has its own path to the GPU, so the transfers overlap.
+  // "independent": each stack has its own path to the GPU, so the transfers
+  // overlap and the slower tier sets the duration.
   return std::max(hbm_duration, hbf_duration);
 }
 
