@@ -51,7 +51,7 @@ inline void validateConfig(const YAML::Node& config) {
       "hbf_bandwidth_scale", "hbm_reserve_fraction", "attn_compute_efficiency",
       "shared_kv_sparsity", "allreduce_hierarchical", "architecture",
       "shoreline_slots", "dies_per_stack", "hbm_sites", "hbf_sites",
-      "hbm_dies_per_site", "hbf_dies_per_site", "nvlink_gen",
+      "hbm_dies_per_site", "hbf_dies_per_site", "link_topology", "nvlink_gen",
       "infiniband_gen", "distribution", "optimization"};
 
   const std::set<std::string> distribution_keys = {

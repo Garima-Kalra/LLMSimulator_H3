@@ -51,7 +51,6 @@ simulation:
   kv_cache_precision_byte: 2 # paper's own 540GB/1M-token shared-cache figure only matches FP16 (2B); weights stay FP8 (precision_byte:1)
   skewness: 0.0
   iter: 10
-  injection_rate: 0
   exit_out_of_memory: off
   mem_cap_limit: on
 
