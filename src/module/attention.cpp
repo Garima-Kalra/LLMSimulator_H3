@@ -24,7 +24,14 @@ SelfAttentionGen::SelfAttentionGen(std::string& prefix, std::string& name,
   // KV cache tensors use kv_cache_precision_byte, which may differ from
   // weight/activation precision_byte (see model_config.h).
   int kv_precision = device->model_config.kv_cache_precision_byte;
-
+    static bool printed_once = false;
+  if (!printed_once) {
+    printf("[KVDBG] batch_size=%d num_kv_heads=%d max_seq_len=%d head_dim=%d "
+           "kv_precision=%d num_layers=%d\n",
+           batch_size, num_kv_heads, max_seq_len, head_dim, kv_precision,
+           device->model_config.num_layers);
+    printed_once = true;
+  }
   std::vector<int> shape = {max_seq_len, head_dim};
   for (int seq_idx = 0; seq_idx < batch_size; seq_idx++) {
     for (int kv_idx = 0; kv_idx < num_kv_heads; kv_idx++) {
@@ -37,6 +44,12 @@ SelfAttentionGen::SelfAttentionGen(std::string& prefix, std::string& name,
           "v_cache_" + std::to_string(seq_idx) + "_" + std::to_string(kv_idx),
           shape, "cache", device, kv_precision);
       add_tensor(v_cache);
+      // H3 Action Item 2: track private KV so it can spill to HBF under HBM
+      // pressure. Only meaningful when use_hbf is on.
+      if (device->config.use_hbf) {
+        device->kv_manager().register_private_kv(k_cache);
+        device->kv_manager().register_private_kv(v_cache);
+      }
     }
   }
 
@@ -89,8 +102,14 @@ Tensor::Ptr SelfAttentionGen::forward(const Tensor::Ptr input,
   std::vector<Tensor::Ptr> tensor_list;
   tensor_list.resize(0);
   tensor_list.push_back(input);
-  tensor_list.push_back(get_cache("k_cache", 0, 0, false));
-  tensor_list.push_back(get_cache("v_cache", 0, 0, false));
+  Tensor::Ptr k_cache_tensor = get_cache("k_cache", 0, 0, false);
+  Tensor::Ptr v_cache_tensor = get_cache("v_cache", 0, 0, false);
+  if (device->config.use_hbf) {
+    device->kv_manager().on_kv_touch(k_cache_tensor);
+    device->kv_manager().on_kv_touch(v_cache_tensor);
+  }
+  tensor_list.push_back(k_cache_tensor);
+  tensor_list.push_back(v_cache_tensor);
 
   if (device->model_config.shared_kv_cache_len > 0) {
     tensor_list.push_back(get_shared_cache("k_cache_shared"));

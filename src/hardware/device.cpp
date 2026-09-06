@@ -60,6 +60,14 @@ Device::Device(SystemConfig config, int device_total_rank, Cluster_ptr cluster)
   mmap_controller = MMapController::Create(memory_config);
   use_ramulator = config.use_ramulator;
   perform_execution = false;
+  HbfParams hbf_params;
+  hbf_params.read_bw_bytes_per_sec = config.hbf_bandwidth;
+  hbf_params.capacity_bytes = config.hbf_capacity;
+  hbf_params.num_stacks = 1;
+  kv_manager_.set_hbf_params(hbf_params);
+
+  long hbm_reserved = (long)(memory_capacity * config.hbm_reserve_fraction);
+  kv_manager_.configure(this, memory_capacity, hbm_reserved);
 }
 
 void Device::set_dependency() { top_module_graph->set_dependency(); }
@@ -202,6 +210,7 @@ void Device::run_ideal(DRAMRequestType dram_request_type, Tensor_Ptr tensor){
     dram_interface->getExecStatus().write_count = (rw_cmd_to_pCH_0 + rw_cmd_to_pCH_1);
   }
 }
+TransientKvManager& Device::kv_manager() { return kv_manager_; }
 
 void Device::initializeDRAM(int ProcessorType, DramEnergy dramEnergy) {
   int num_pseudo_ch = 0;

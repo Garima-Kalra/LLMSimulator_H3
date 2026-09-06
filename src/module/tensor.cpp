@@ -22,6 +22,7 @@ Tensor::Tensor(std::string name, std::vector<int> shape, std::string tag,
   if (device != nullptr && device->config.use_hbf &&
       (tag == "weight" || tag == "cache_shared")) {
     in_hbf = true;
+    device->kv_manager().account_hbf_static(tag, getSize());
   }
 }
 

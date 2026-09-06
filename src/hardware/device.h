@@ -11,6 +11,7 @@
 #include "module/status.h"
 #include "scheduler/sequence.h"
 #include "dram/power.h"
+#include "module/transient_kv_manager.h"
 
 namespace llm_system {
 
@@ -34,6 +35,8 @@ class Device : public std::enable_shared_from_this<Device> {
 
   SystemConfig config;
 
+  TransientKvManager& kv_manager();
+
   // rank in node
   int device_local_rank;
   // rank in cluster
@@ -55,6 +58,15 @@ class Device : public std::enable_shared_from_this<Device> {
 
   void setModelConfig(ModelConfig& _model_config) {
     model_config = _model_config;
+    int cp = model_config.context_parallel_degree > 0
+                 ? model_config.context_parallel_degree : 1;
+    int head_tp = model_config.ne_tp_dg / cp;
+    if (head_tp < 1) head_tp = 1;
+    int kvh = model_config.num_kv_heads / head_tp;
+    if (kvh < 1) kvh = 1;
+    kv_manager_.set_kv_geometry(model_config.num_layers, kvh,
+                                model_config.head_dim,
+                                model_config.kv_cache_precision_byte);
   }
 
   time_ns get_time() { return status.device_time; }
@@ -113,6 +125,7 @@ class Device : public std::enable_shared_from_this<Device> {
   ExecStatus low_exec_status;
   ExecStatus exec_status;
 
+  TransientKvManager kv_manager_;
   bool use_ramulator;
 
   Device(SystemConfig config, int device_total_rank, Cluster_ptr cluster);

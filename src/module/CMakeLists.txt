@@ -24,4 +24,5 @@ target_sources(
     residual.cpp
     expert.cpp
     lm_head.cpp
+    transient_kv_manager.cpp
 )

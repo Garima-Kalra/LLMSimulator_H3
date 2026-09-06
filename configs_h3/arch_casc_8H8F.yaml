@@ -9,6 +9,7 @@ system:
   num_device: 8
   processor_type: GPU
   use_hbf: on # H3: add High Bandwidth Flash as a second memory tier (weights + shared KV cache)
+  hbm_reserve_fraction: 0.0821 # framework/workspace/fragmentation headroom; calibrated to paper Fig.5
   architecture: cascaded
   hbm_sites: 8
   hbf_sites: 0

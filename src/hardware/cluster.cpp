@@ -575,6 +575,9 @@ std::vector<Stat> Cluster::runIterationMixed(int iter, std::ofstream &csv) {
   auto start = std::chrono::high_resolution_clock::now();
 
   for (int i = 0; i < iter; i++) {
+    for (int d = 0; d < config.num_device * config.num_node; d++) {
+      get_device(d)->kv_manager().advance_step();
+    }
     // export to csv, you can modify the frequency of export_to_csv by changing the number. now it is 1
     if (i % 1 == 0) {
       auto duration = std::chrono::duration_cast<std::chrono::seconds>(
@@ -584,6 +587,22 @@ std::vector<Stat> Cluster::runIterationMixed(int iter, std::ofstream &csv) {
     }
 
     auto metadata = scheduler->setMetadata();
+    if (config.use_hbf && !metadata.empty()) {
+      int total_dev = config.num_device * config.num_node;
+      for (int d = 0; d < total_dev; d++) {
+        size_t mi = (metadata.size() == (size_t)total_dev) ? (size_t)d : 0;
+        auto md = metadata.at(mi);
+        if (md == nullptr) continue;
+        auto seqs = md->get_seq();
+        std::vector<int> ids;
+        std::vector<long> lens;
+        for (size_t si = 0; si < seqs.size(); si++) {
+          ids.push_back((int)si);
+          lens.push_back((long)seqs.at(si)->current_len);
+        }
+        get_device(d)->kv_manager().sync_batch(ids, lens);
+      }
+    }
     run(metadata);
     time_ns time = get_device(0)->status.device_time;
 

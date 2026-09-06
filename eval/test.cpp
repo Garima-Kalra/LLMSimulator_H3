@@ -582,7 +582,25 @@ int main(int argc, char *argv[]) {
               << "  ctx_shared=" << st.attn_m_ctx_shared/1e6
               << "  TOTAL=" << st.attn_memory_time/1e6 << "\n\n";
   }
-
+  // H3 Action Item 2: HBM->HBF private-KV spill traffic, aggregated across
+  // devices. Simulated wall clock is total_latency below, so this block must
+  // stay after the stat_list loop -- move it if you reorder.
+  uint64_t hbf_wr_logical = 0, hbf_wr_physical = 0, hbf_rd = 0;
+  uint64_t mig_out = 0, mig_in = 0;
+  for (int d = 0; d < num_device * num_node; d++) {
+    auto& s = cluster->get_device(d)->kv_manager().stats();
+    hbf_wr_logical  += s.hbf_logical_write_bytes;
+    hbf_wr_physical += s.hbf_physical_write_bytes;
+    hbf_rd          += s.hbf_read_bytes;
+    mig_out         += s.migrations_out_count;
+    mig_in          += s.migrations_in_count;
+  }
+  cluster->get_device(0)->kv_manager().dump("device0");
+  std::cout << "[HBF WRITE] aggregate over " << (num_device * num_node)
+            << " devices: logical " << hbf_wr_logical / 1073741824.0
+            << " GiB, physical " << hbf_wr_physical / 1073741824.0
+            << " GiB, reads " << hbf_rd / 1073741824.0
+            << " GiB, migrations " << mig_out << "/" << mig_in << "\n";
   std::string results_log_path = "../results.log";
   bool write_header = !std::ifstream(results_log_path).good();
   std::ofstream results_log(results_log_path, std::ios::app);
@@ -596,7 +614,10 @@ int main(int argc, char *argv[]) {
                     "context_window,input_len,"
                     "output_len,requested_max_batch_size,final_max_batch_size,"
                     "throughput_tps,per_device_power_w,total_power_w,"
-                    "throughput_per_power\n";
+                    "throughput_per_power,"
+                    "hbf_write_gib_logical,hbf_write_gib_physical,"
+                    "hbf_read_gib,hbf_migrations_out,hbf_migrations_in,"
+                    "hbf_write_gib_per_ktoken\n";
   }
   results_log << std::time(nullptr) << ","
               << git_revision() << ","
@@ -630,7 +651,15 @@ int main(int argc, char *argv[]) {
               << throughput_tps << ","
               << per_device_power_watts << ","
               << total_power_watts << ","
-              << throughput_per_power << "\n";
+              << throughput_per_power << ","
+              << hbf_wr_logical / 1073741824.0 << ","
+              << hbf_wr_physical / 1073741824.0 << ","
+              << hbf_rd / 1073741824.0 << ","
+              << mig_out << ","
+              << mig_in << ","
+              << (total_tokens > 0
+                      ? (hbf_wr_physical / 1073741824.0) / (total_tokens / 1000.0)
+                      : 0.0) << "\n";
   results_log.close();
 
   return 0;
