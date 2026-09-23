@@ -115,6 +115,10 @@ int main(int argc, char *argv[]) {
   // sigma: shared-KV selection fraction (scales shared bytes AND shared FLOPs).
   system_config.shared_kv_sparsity =
       config["system"]["shared_kv_sparsity"].as<double>(1.0);
+  system_config.hbm_oversubscribe_fraction =
+    config["system"]["hbm_oversubscribe_fraction"].as<double>(0.0);   
+  system_config.hbf_flush_threshold =
+    config["system"]["hbf_flush_threshold"].as<double>(0.75); 
   // Memory-link timing model, consumed by h3MemoryDuration():
   //   independent  -> tiers overlap,  max(hbm, hbf)
   //   cascaded /
@@ -332,7 +336,9 @@ int main(int argc, char *argv[]) {
     model_config = llama4_scout;
   }else if (!model_name.compare("llama4_maverick")) {
     model_config = llama4_maverick;
-  } 
+  }  else if (!model_name.compare("glam")) {
+  model_config = glam;
+  }
   else {
     fail("No model configuration of " + model_name);
   }
@@ -615,9 +621,16 @@ int main(int argc, char *argv[]) {
   uint64_t hbf_wr_logical = 0, hbf_wr_physical = 0, hbf_rd = 0;
   uint64_t mig_out = 0, mig_in = 0;
   for (int d = 0; d < num_device * num_node; d++) {
+    cluster->get_device(d)->kv_manager().drain_flash();
+  }
+  for (int d = 0; d < num_device * num_node; d++) {
     auto& s = cluster->get_device(d)->kv_manager().stats();
-    hbf_wr_logical  += s.hbf_logical_write_bytes;
-    hbf_wr_physical += s.hbf_physical_write_bytes;
+    // Totals, not just migrations: hbf_logical_write_bytes covers only
+    // whole-sequence spills. Per-step appends are a separate population
+    // (hbf_append_*) and are where write amplification actually arises,
+    // since they arrive at 512 B against a 4096 B page.
+    hbf_wr_logical  += s.hbf_total_logical_write_bytes();
+    hbf_wr_physical += s.hbf_total_physical_write_bytes();
     hbf_rd          += s.hbf_read_bytes;
     mig_out         += s.migrations_out_count;
     mig_in          += s.migrations_in_count;
@@ -686,7 +699,10 @@ int main(int argc, char *argv[]) {
               << mig_in << ","
               << (total_tokens > 0
                       ? (hbf_wr_physical / 1073741824.0) / (total_tokens / 1000.0)
-                      : 0.0) << "\n";
+                      : 0.0) << ","
+              << (cluster->get_device(0)->kv_manager().flash_model_enabled()
+              ? cluster->get_device(0)->kv_manager().flash_stats().waf()
+              : 0.0) << "\n";
   results_log.close();
 
   return 0;

@@ -26,6 +26,33 @@ void TransientKvManager::set_kv_geometry(int num_layers, int num_kv_heads,
                         precision_bytes;
 }
 
+void TransientKvManager::enable_flash_model(int max_streams,
+                                            double flush_threshold,
+                                            long spare_capacity_bytes,
+                                            double gc_low_water) {
+  wbuf_.configure(max_streams, hbf_.block_bytes(), flush_threshold);
+  flash_.configure(spare_capacity_bytes, hbf_.block_bytes(), hbf_.page_bytes,
+                   hbf_.pe_cycles, gc_low_water, AllocPolicy::kPerSequence);
+  flash_enabled_ = true;
+}
+
+void TransientKvManager::drain_flash() {
+  if (!flash_enabled_) return;
+  // Partial blocks still occupy a whole block each. Credit them to the
+  // append stats -- omitting them made total physical < total logical, which
+  // is impossible, and was the tell that they were being dropped.
+  long resident = wbuf_.resident_bytes();
+  long f = wbuf_.drain();
+  if (f > 0) {
+    long phys = flash_.write(resident, f, 0);
+    stats_.hbf_append_physical_bytes += phys;
+    stats_.hbf_write_time_sec += double(phys) / hbf_.write_bw_bytes_per_sec();
+  }
+  stats_.buffer_flushes = wbuf_.flushes();
+  stats_.buffer_wasted_bytes = wbuf_.wasted_bytes();
+  stats_.buffer_resident_bytes = 0;
+}
+
 void TransientKvManager::advance_step() {
   current_step_++;
   stats_.steps_observed = current_step_;
@@ -65,6 +92,11 @@ void TransientKvManager::lru_touch(int id) {
 void TransientKvManager::release(int id) {
   auto it = records_.find(id);
   if (it == records_.end()) return;
+  // A finished sequence invalidates every flash page it owns. With
+  // per-sequence allocation those are whole blocks, so they become erasable
+  // with ZERO copying -- the death-correlation property that makes KV the
+  // friendliest possible flash workload.
+  if (flash_enabled_ && it->second.in_hbf) flash_.invalidate_sequence(id);
   if (!it->second.in_hbf) hbm_used_bytes_ -= it->second.bytes;
   lru_unlink(id);
   records_.erase(it);
@@ -109,12 +141,36 @@ void TransientKvManager::sync_batch(const std::vector<int>& seq_ids,
         // small write. This is the population the write-combining buffer is
         // meant to absorb -- counted separately from whole-seq migrations.
         if (grew > 0) {
-          long phys = hbf_.physical_write_bytes(grew);
           stats_.hbf_append_logical_bytes += grew;
-          stats_.hbf_append_physical_bytes += phys;
           stats_.hbf_append_count += 1;
-          stats_.hbf_write_time_sec += double(phys) /
-                                       hbf_.write_bw_bytes_per_sec();
+          long phys;
+          if (flash_enabled_) {
+            // Combine per-(layer,sequence) appends until a block's worth
+            // accumulates; only then does flash see a write and a block get
+            // consumed. Amplification becomes a function of the flush
+            // threshold instead of a hardcoded constant.
+            long flushed = wbuf_.append(id, grew);
+            if (flushed > 0) {
+              // flushed is a whole number of blocks. The logical payload in
+              // them is (blocks x threshold); the rest is flush waste, which
+              // is exactly the amplification being measured.
+              long blocks = flushed / wbuf_.block_bytes();
+              long logical_in = blocks * wbuf_.threshold_bytes();
+              phys = flash_.write(logical_in, flushed, id);
+            } else {
+              phys = 0;
+            }
+            stats_.buffer_resident_bytes = (uint64_t)wbuf_.resident_bytes();
+            stats_.buffer_flushes = wbuf_.flushes();
+            stats_.buffer_wasted_bytes = wbuf_.wasted_bytes();
+          } else {
+            phys = hbf_.physical_write_bytes(grew);  // legacy fixed WAF
+          }
+          stats_.hbf_append_physical_bytes += phys;
+          if (phys > 0) {
+            stats_.hbf_write_time_sec +=
+                double(phys) / hbf_.write_bw_bytes_per_sec();
+          }
         }
       } else {
         hbm_used_bytes_ += grew;
@@ -163,7 +219,11 @@ void TransientKvManager::spill_to_hbf(int id) {
   hbm_used_bytes_ -= rec.bytes;
 
   const long logical = rec.bytes;
-  const long physical = hbf_.physical_write_bytes(logical);
+  // A whole-sequence migration is ~62 MB of contiguous block-aligned data
+  // (126 layers x ~1010 tokens x 512 B) -- it already fills 62 whole blocks,
+  // so it needs no write combining and goes straight to flash.
+  const long physical = flash_enabled_ ? flash_.write(logical, id)
+                                       : hbf_.physical_write_bytes(logical);
   stats_.hbf_logical_write_bytes += logical;
   stats_.hbf_physical_write_bytes += physical;
   stats_.migrations_out_count += 1;
@@ -235,6 +295,13 @@ void TransientKvManager::dump(const char* label) const {
   std::printf("  HBF writes  physical : %.3f GiB  (WAF %.3f)\n",
               stats_.hbf_total_physical_write_bytes() / GiB,
               stats_.effective_waf());
+  if (flash_enabled_) {
+    std::printf("  buffer resident      : %.3f GiB  (%lu flushes, %.3f GiB wasted)\n",
+                stats_.buffer_resident_bytes / GiB,
+                (unsigned long)stats_.buffer_flushes,
+                stats_.buffer_wasted_bytes / GiB);
+    flash_.dump(label);
+  }
   std::printf("  HBF reads            : %.3f GiB\n",
               stats_.hbf_read_bytes / GiB);
   std::printf("  migrations out / in  : %lu / %lu\n",

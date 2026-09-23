@@ -436,8 +436,55 @@ bool Cluster::checkH3MemorySize() {
                 << avail_capacity / 1024.0 / 1024 / 1024 << "GB" << std::endl;
       std::cout << "Private KV cache per seq is "
                 << kv_cache_size_per_seq / 1024.0 / 1024 / 1024 << "GB" << std::endl;
-      int max_batch_size =
-          (int)(avail_capacity / kv_cache_size_per_seq) * scheduler->dp_degree;
+      int hbm_resident_batch =
+          (int)(avail_capacity / kv_cache_size_per_seq) * scheduler->dp_degree - 1;
+
+      // Oversubscription: admit beyond what HBM physically holds and let HBF
+      // absorb the tail. This is the ONLY mechanism by which flash is written
+      // under H3's placement -- weights and the shared cache are written once
+      // and then read-only -- so it is the only way the paper's endurance
+      // claim can be tested. hbm_oversubscribe_fraction = 0 is unchanged
+      // behaviour: cap the batch so private KV always fits.
+      int max_batch_size = hbm_resident_batch + 1;
+      if (config.hbm_oversubscribe_fraction > 0.0) {
+        max_batch_size =
+            (int)(hbm_resident_batch *
+                  (1.0 + config.hbm_oversubscribe_fraction)) + 1;
+        std::cout << "H3: HBM-resident ceiling " << hbm_resident_batch
+                  << ", oversubscribing "
+                  << config.hbm_oversubscribe_fraction * 100 << "% -> "
+                  << max_batch_size - 1 << " admitted ("
+                  << (max_batch_size - 1 - hbm_resident_batch)
+                  << " sequences must spill to HBF)" << std::endl;
+      }
+
+      // TransientKvManager's budget is the HBM ACTUALLY AVAILABLE TO PRIVATE
+      // KV, i.e. avail_capacity. It is set here rather than in the Device
+      // constructor because avail_capacity depends on the activation working
+      // set, hence on the batch size, which is not known until now.
+      //
+      // The previous version passed memory_capacity * hbm_reserve_fraction
+      // from Device::Device -- that is the framework/fragmentation overhead,
+      // a different quantity. It made the budget ~2.7x too generous (176 GiB
+      // reported where 64.8 GiB was free), so make_room_if_needed() never
+      // fired and no spill was ever recorded.
+      for (int d = 0; d < config.num_device * config.num_node; d++) {
+        get_device(d)->kv_manager().configure(get_device(d).get(),
+                                              (long)avail_capacity, 0L);
+
+        // Modelled flash write path. Only meaningful when something can
+        // actually spill -- at zero oversubscription nothing is written and
+        // the model would report a WAF of 0/0.
+        if (config.hbm_oversubscribe_fraction > 0.0) {
+          long spare = (long)(config.hbf_capacity - hbf_size);
+          get_device(d)->kv_manager().enable_flash_model(
+              /* max_streams        */ max_batch_size,
+              /* flush_threshold    */ config.hbf_flush_threshold,
+              /* spare_capacity     */ spare,
+              /* gc_low_water       */ 0.10);
+        }
+      }
+
       std::cout << "H3: Modify max_batch_size to " << max_batch_size - 1
                 << std::endl;
       scheduler->total_batch_size = max_batch_size - 1;
@@ -587,6 +634,9 @@ std::vector<Stat> Cluster::runIterationMixed(int iter, std::ofstream &csv) {
     }
 
     auto metadata = scheduler->setMetadata();
+    // H3: drive the KV residency model from the LIVE batch, once per step.
+    // This is the only place the real (post-cap) batch and the real
+    // per-sequence lengths are both in scope.
     if (config.use_hbf && !metadata.empty()) {
       int total_dev = config.num_device * config.num_node;
       for (int d = 0; d < total_dev; d++) {

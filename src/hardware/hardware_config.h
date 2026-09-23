@@ -234,7 +234,21 @@ class SystemConfig {
   //                  all traffic crosses one shared link and serializes
   //   "shared_base"  mixed dies over one base die, one link per stack
   std::string link_topology = "independent";
-
+  // Fraction by which admission may exceed what HBM can physically hold for
+  // private KV. The excess spills to HBF -- the only mechanism by which flash
+  // is written under H3's placement, since weights and the shared cache are
+  // written once and then read-only. 0.0 = today's behaviour (cap to fit).
+  //
+  // Sizing (llama3_405B, 10M, 14H2F): write bandwidth is never the limit --
+  // even at 1.0 writes are <3% of a decode step. ENDURANCE is: 0.05 -> ~5.8
+  // yr device life, 0.25 -> ~1.2 yr, 1.0 -> ~0.3 yr.
+  hw_metric hbm_oversubscribe_fraction = 0.0;
+  // Fraction of an erase block accumulated in the DRAM write-combining
+  // buffer before flushing to flash. Appends arrive per (layer, sequence) at
+  // 512 B against a 4096 B page, so unbuffered amplification is 8x; 0.75
+  // gives 1.33x. Sweeping this is the experiment: higher threshold means
+  // lower amplification but more HBM held by the buffer.
+  hw_metric hbf_flush_threshold = 0.75;
   // Stack sites available on the GPU shoreline. Cascaded HBF consumes none;
   // side-by-side HBF displaces an HBM stack.
   int shoreline_slots = 8;

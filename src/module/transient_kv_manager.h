@@ -13,6 +13,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "module/hbf_flash.h"
+
 namespace llm_system {
 
 class Device;
@@ -93,6 +95,14 @@ struct TransientKvStats {
                ? double(hbf_logical_write_bytes) / migrations_out_count
                : 0.0;
   }
+  // Buffer residency, charged against the HBM KV budget. A spilled sequence
+  // does NOT fully vacate HBM: pending appends stay resident until a block's
+  // worth accumulates. That is the entire cost of the write buffer, because
+  // the data was already in HBM -- buffering only DEFERS the flush.
+  uint64_t buffer_resident_bytes = 0;
+  uint64_t buffer_flushes = 0;
+  uint64_t buffer_wasted_bytes = 0;
+
   double bytes_per_append() const {
     return hbf_append_count
                ? double(hbf_append_logical_bytes) / hbf_append_count
@@ -128,6 +138,25 @@ class TransientKvManager {
   // Opt-in: let spilling drive Tensor::in_hbf and thus the timing model.
   void set_perturb_cost_model(bool on) { perturb_cost_model_ = on; }
 
+  // Enable the modelled flash write path: per-sequence write-combining
+  // buffer + block-level GC. Makes write amplification a MEASURED output
+  // rather than the hardcoded HbfParams::waf.
+  //
+  // Appends arrive per (layer, sequence) at 512 B against a 4096 B page, so
+  // unbuffered amplification is 8x; at flush_threshold 0.75 it is 1.33x.
+  //
+  // Streams are PER SEQUENCE. In DRAM that costs ~0.6% of the KV budget
+  // rather than the 0.04% per-layer pooling would, but it makes each block
+  // hold one sequence -- so a finished sequence invalidates whole blocks and
+  // GC copies nothing. On-package SRAM (the paper's LHB is 40 MB) could not
+  // afford this; DRAM can, which is why the buffer lives in HBM.
+  void enable_flash_model(int max_streams, double flush_threshold,
+                          long spare_capacity_bytes, double gc_low_water);
+  bool flash_model_enabled() const { return flash_enabled_; }
+  const FlashStats& flash_stats() const { return flash_.stats(); }
+  const FlashDevice& flash() const { return flash_; }
+  void drain_flash();
+
   const TransientKvStats& stats() const { return stats_; }
   long hbm_used_bytes() const { return hbm_used_bytes_; }
   long hbm_budget_for_kv_bytes() const { return hbm_budget_for_kv_bytes_; }
@@ -152,6 +181,10 @@ class TransientKvManager {
 
   std::unordered_map<int, SeqRecord> records_;
   std::list<int> lru_order_;
+
+  bool flash_enabled_ = false;
+  WriteBuffer wbuf_;
+  FlashDevice flash_;
 
   TransientKvStats stats_;
 

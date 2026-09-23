@@ -66,8 +66,12 @@ Device::Device(SystemConfig config, int device_total_rank, Cluster_ptr cluster)
   hbf_params.num_stacks = 1;
   kv_manager_.set_hbf_params(hbf_params);
 
-  long hbm_reserved = (long)(memory_capacity * config.hbm_reserve_fraction);
-  kv_manager_.configure(this, memory_capacity, hbm_reserved);
+  // KV budget is NOT set here -- it is HBM available to private KV, which
+  // only Cluster::checkH3MemorySize() knows (avail_capacity), because it
+  // depends on the activation working set and hence the batch size, decided
+  // after every Device is constructed. The old line passed
+  // memory_capacity * hbm_reserve_fraction (framework overhead, a different
+  // quantity), making the budget ~2.7x too generous so spilling never fired.
 }
 
 void Device::set_dependency() { top_module_graph->set_dependency(); }
