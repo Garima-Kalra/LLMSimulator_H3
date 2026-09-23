@@ -248,6 +248,7 @@ class SystemConfig {
   // 512 B against a 4096 B page, so unbuffered amplification is 8x; 0.75
   // gives 1.33x. Sweeping this is the experiment: higher threshold means
   // lower amplification but more HBM held by the buffer.
+  std::string experiment_mode = "h3_extended";
   hw_metric hbf_flush_threshold = 0.75;
   // Stack sites available on the GPU shoreline. Cascaded HBF consumes none;
   // side-by-side HBF displaces an HBM stack.

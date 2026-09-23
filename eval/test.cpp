@@ -115,6 +115,8 @@ int main(int argc, char *argv[]) {
   // sigma: shared-KV selection fraction (scales shared bytes AND shared FLOPs).
   system_config.shared_kv_sparsity =
       config["system"]["shared_kv_sparsity"].as<double>(1.0);
+  system_config.experiment_mode =
+    config["system"]["experiment_mode"].as<std::string>("h3_extended");
   system_config.hbm_oversubscribe_fraction =
     config["system"]["hbm_oversubscribe_fraction"].as<double>(0.0);   
   system_config.hbf_flush_threshold =
@@ -214,7 +216,40 @@ int main(int argc, char *argv[]) {
     printf("+================================================================+\n\n");
     use_hbf = system_config.use_hbf;   // local drives the memory-check path below
   }
+    if (system_config.experiment_mode == "h3_paper") {
+    auto forbid = [&](bool bad, const std::string& what) {
+      if (bad) fail("experiment_mode: h3_paper -- " + what +
+                    " is an extension and must be off for paper reproduction.");
+    };
+    forbid(system_config.hbm_oversubscribe_fraction > 0.0,
+           "hbm_oversubscribe_fraction (spill / HBF writes / GC / wear)");
+    forbid(arch != "legacy" && arch != "cascaded",
+           "architecture '" + arch + "'");
+    forbid(system_config.attn_compute_efficiency != 1.0,
+           "attn_compute_efficiency");
+    forbid(system_config.shared_kv_sparsity != 1.0, "shared_kv_sparsity");
 
+    auto require = [&](bool present, const std::string& key,
+                       const std::string& why) {
+      if (!present) std::cerr << "[h3_paper] " << key << " not set -- " << why
+                              << ". State this in the assumptions table.\n";
+    };
+    require((bool)config["system"]["allreduce_hierarchical"],
+            "allreduce_hierarchical",
+            "paper says only \"ring all-reduce\"; the two kinds differ ~2x");
+    require((bool)config["simulation"]["cag_amortize_shared_compute"],
+            "cag_amortize_shared_compute", "paper gives no mechanism");
+    require((bool)config["system"]["hbm_reserve_fraction"],
+            "hbm_reserve_fraction", "CALIBRATED, not derived");
+    require((bool)config["simulation"]["kv_cache_precision_byte"],
+            "kv_cache_precision_byte", "derived from the paper's 540 GB figure");
+    require((bool)config["system"]["distribution"]["context_parallel_degree"],
+            "context_parallel_degree", "needed to reach 32 GPUs");
+
+    std::cout << "[experiment_mode] h3_paper -- extensions disabled\n";
+  } else {
+    std::cout << "[experiment_mode] h3_extended\n";
+  }
   // NVLink Config // 
   if(config["system"]["nvlink_gen"].as<int>() == 4){
     system_config.device_ict_bandwidth = 450.0 * 1000 * 1000 * 1000; // B/s NVLink 4th Gen (H100)

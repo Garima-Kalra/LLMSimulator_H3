@@ -52,7 +52,7 @@ inline void validateConfig(const YAML::Node& config) {
       "shared_kv_sparsity", "allreduce_hierarchical", "architecture",
       "shoreline_slots", "dies_per_stack", "hbm_sites", "hbf_sites",
       "hbm_dies_per_site", "hbf_dies_per_site", "link_topology","hbm_oversubscribe_fraction", "nvlink_gen",
-      "infiniband_gen", "distribution", "optimization"};
+      "infiniband_gen", "distribution", "optimization", "experiment_mode"};
 
   const std::set<std::string> distribution_keys = {
       "expert_tensor_degree", "none_expert_tensor_degree",

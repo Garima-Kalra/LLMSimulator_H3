@@ -1,0 +1,7 @@
+]633;E;echo "LLMSimulator commit = $(git rev-parse HEAD)";8ee229c7-0e0d-40cb-b152-9317f2fdac50]633;CLLMSimulator commit = 03c642c88367fe035770b897c24ae0e5f854f98e
+branch              = h3-verification
+submodule           =  b5262869b24790e5ec62d9d9974fca9bbb4f54e0 src/dram/ramulator2 (b526286)
+compiler            = g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0
+cmake               = cmake version 3.28.3
+OS                  = Ubuntu 24.04.4 LTS
+date                = 2026-09-23T23:50:10+05:30
