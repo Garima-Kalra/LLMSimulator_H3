@@ -1,0 +1,10 @@
+system:
+  experiment_mode: h3_paper
+  architecture: cascaded              # the paper's Fig. 3(a) layout
+  hbm_reserve_fraction: 0.0821        # CALIBRATED to the paper's Fig. 5
+  allreduce_hierarchical: false       # paper says only "ring all-reduce"
+  distribution:
+    context_parallel_degree: 4        # needed to reach 32 GPUs
+simulation:
+  cag_amortize_shared_compute: true   # paper asserts, gives no mechanism
+  kv_cache_precision_byte: 2          # from the paper's 540 GB figure
