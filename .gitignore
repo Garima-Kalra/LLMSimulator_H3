@@ -5,3 +5,6 @@ ext/
 build/
 log/
 *.log
+
+# Research-paper PDFs are publisher/author copyright: keep them out of this public repo
+docs/literature/**/*.pdf
