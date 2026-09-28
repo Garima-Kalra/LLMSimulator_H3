@@ -76,6 +76,12 @@ class StatusBoard {
   time_ns attn_compute_time = 0;
   time_ns attn_memory_time = 0;
 
+  // Which side of the roofline bound each linear layer. A memory-model change
+  // can be invisible in the output when max() selects compute, which is what
+  // happened with the pooled-link model at batch 1456.
+  long linear_compute_bound_ops = 0;
+  long linear_memory_bound_ops  = 0;
+
   // Term-by-term breakdown for closed-form reconciliation. Sums to the two
   // totals above; dumped by eval/test.cpp so every component of T_comp and
   // T_mem can be checked against an independent hand derivation.

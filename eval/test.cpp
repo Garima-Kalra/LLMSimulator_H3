@@ -650,6 +650,15 @@ int main(int argc, char *argv[]) {
               << "  TOTAL=" << st.attn_memory_time/1e6 << "\n\n";
   }
 
+  // Which side of the roofline bound each linear layer (device 0). Printed so
+  // a memory-model change that max() hides behind compute is visible.
+  {
+    auto &st = cluster->get_device(0)->status;
+    std::cout << "[LINEAR BOUND] (device 0) compute_bound_ops="
+              << st.linear_compute_bound_ops
+              << "  memory_bound_ops=" << st.linear_memory_bound_ops << "\n\n";
+  }
+
   // H3 Action Item 2: HBM->HBF private-KV spill traffic, aggregated across
   // devices. Simulated wall clock is total_latency below, so this block must
   // stay after the stat_list loop -- move it if you reorder.

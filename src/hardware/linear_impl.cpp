@@ -64,7 +64,14 @@ ExecStatus LinearExecutionGPU(Device_Ptr device, Tensor_Ptr input,
 
   exec_status.total_duration =
       std::max(exec_status.compute_duration, exec_status.memory_duration);
-
+  // Record which side of the roofline bound this operation. Without it,
+  // a memory-model change can be entirely invisible in the output because
+  // max() selected compute, which is what happened with the pooled-link
+  // model on linear layers at batch 1456.
+  if (exec_status.compute_duration > exec_status.memory_duration)
+    device->status.linear_compute_bound_ops++;
+  else
+    device->status.linear_memory_bound_ops++;
   exec_status.compute_util = 1000.0 * 1000.0 * 1000.0 * total_flops /
                              compute_peak_flops / exec_status.total_duration;
   exec_status.memory_util = 1000.0 * 1000.0 * 1000.0 * total_memory_size /
